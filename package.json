@@ -1,7 +1,7 @@
 {
   "name": "netwatch-topology",
   "version": "1.0.0",
-  "description": "Network Topology + Live SSH Monitor \u2014 Netwatch Integration",
+  "description": "Netwatch Analyzer \u2014 Analisador de Show Tech (Cisco / Stratix) + Live SSH Monitor",
   "main": "dist-electron/main/index.js",
   "scripts": {
     "dev": "concurrently -k \"npm run dev:vite\" \"npm run dev:electron\"",
@@ -42,7 +42,7 @@
   },
   "build": {
     "appId": "com.netwatch.monitor",
-    "productName": "Netwatch",
+    "productName": "Netwatch Analyzer",
     "copyright": "Copyright \u00a9 2025 Netwatch",
     "directories": {
       "output": "release",

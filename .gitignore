@@ -16,3 +16,7 @@ __pycache__/
 .env
 .env.local
 *.local
+
+# Backups / temp
+*.bak
+tmp_*.js

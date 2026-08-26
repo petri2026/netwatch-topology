@@ -16,24 +16,19 @@ const TABS: { id: Tab; label: string; icon: string }[] = [
 function NetwatchIcon({ size = 28 }: { size?: number }) {
   return (
     <svg width={size} height={size} viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
-      <rect x="2" y="10" width="28" height="12" rx="2" fill="#1e3a5f" stroke="#22d3ee" strokeWidth="1.2"/>
-      <rect x="3" y="11" width="26" height="2.5" rx="1" fill="#0d2d4a"/>
-      <circle cx="5.5" cy="18" r="1.2" fill="#10b981"/>
-      <rect x="9" y="15" width="2.4" height="1.8" rx="0.4" fill="#22d3ee" opacity="0.85"/>
-      <rect x="12" y="15" width="2.4" height="1.8" rx="0.4" fill="#22d3ee" opacity="0.85"/>
-      <rect x="15" y="15" width="2.4" height="1.8" rx="0.4" fill="#22d3ee" opacity="0.85"/>
-      <rect x="18" y="15" width="2.4" height="1.8" rx="0.4" fill="#22d3ee" opacity="0.85"/>
-      <rect x="21" y="15" width="2.4" height="1.8" rx="0.4" fill="#22d3ee" opacity="0.85"/>
-      <rect x="24" y="15" width="2.4" height="1.8" rx="0.4" fill="#22d3ee" opacity="0.85"/>
-      <rect x="9" y="17.5" width="2.4" height="1.8" rx="0.4" fill="#22d3ee" opacity="0.5"/>
-      <rect x="12" y="17.5" width="2.4" height="1.8" rx="0.4" fill="#22d3ee" opacity="0.5"/>
-      <rect x="15" y="17.5" width="2.4" height="1.8" rx="0.4" fill="#22d3ee" opacity="0.5"/>
-      <rect x="18" y="17.5" width="2.4" height="1.8" rx="0.4" fill="#22d3ee" opacity="0.5"/>
-      <rect x="21" y="17.5" width="2.4" height="1.8" rx="0.4" fill="#22d3ee" opacity="0.5"/>
-      <rect x="24" y="17.5" width="2.4" height="1.8" rx="0.4" fill="#22d3ee" opacity="0.5"/>
-      <rect x="26.5" y="14.5" width="3" height="3" rx="0.5" fill="#f59e0b" opacity="0.9"/>
-      <rect x="0" y="11" width="2" height="10" rx="1" fill="#263347"/>
-      <rect x="30" y="11" width="2" height="10" rx="1" fill="#263347"/>
+      <defs>
+        <linearGradient id="nwIcon" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0" stopColor="#22d3ee"/><stop offset="1" stopColor="#3b82f6"/>
+        </linearGradient>
+      </defs>
+      {/* network node container */}
+      <rect x="3" y="3" width="26" height="26" rx="6.5" fill="#0d1b2e" stroke="url(#nwIcon)" strokeWidth="1.6"/>
+      {/* ascending bar chart (analytics) */}
+      <rect x="9"  y="18" width="3.2" height="6"  rx="1" fill="url(#nwIcon)"/>
+      <rect x="14" y="14" width="3.2" height="10" rx="1" fill="url(#nwIcon)"/>
+      <rect x="19" y="10" width="3.2" height="14" rx="1" fill="url(#nwIcon)"/>
+      {/* live signal node */}
+      <circle cx="21" cy="8" r="2.1" fill="#10b981"/>
     </svg>
   )
 }
@@ -68,7 +63,7 @@ export default function App() {
       }}>
         <div style={{ WebkitAppRegion: 'no-drag', flexShrink: 0 }}><NetwatchIcon size={26} /></div>
         <div style={{ WebkitAppRegion: 'no-drag' }}>
-          <h1 style={{ fontSize: 12, fontWeight: 700, color: '#fff', lineHeight: 1, margin: 0 }}>Netwatch</h1>
+          <h1 style={{ fontSize: 12, fontWeight: 700, color: '#fff', lineHeight: 1, margin: 0 }}>Netwatch Analyzer</h1>
           {appVersion && <p style={{ fontSize: 9, color: 'rgba(255,255,255,0.2)', margin: '2px 0 0' }}>v{appVersion}</p>}
         </div>
         <nav style={{ display: 'flex', gap: 3, marginLeft: 20, WebkitAppRegion: 'no-drag' }}>

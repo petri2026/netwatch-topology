@@ -20,6 +20,40 @@ interface InterfaceStatusEntry {
   port: string; name: string; status: string
   vlan: string; duplex: string; speed: string; type: string
 }
+// ── DLR (Device Level Ring) — EtherNet/IP ring on Stratix switches ─────────
+interface DlrRingConfig {       // from show running-config
+  ring: number; mode: string    // e.g. { ring: 1, mode: 'supervisor' }
+}
+interface DlrInterface {        // interface ↔ ring assignment (running-config)
+  iface: string; ring: number   // e.g. { iface: 'Gi1/1', ring: 1 }
+}
+interface DlrPort { name: string; vlan: string; state: string }        // Gi1/1, vlan 2074, UP
+interface DlrParticipant { no: number; mac: string; ip: string }       // ring member
+interface DlrFaultLocation { label: string; mac: string; ip: string }  // last active node on port N
+interface DlrRingStatus {        // from "show dlr ring" (detailed)
+  ring: number
+  mode: string                   // runtime role, e.g. 'Active Supervisor'
+  topology: string               // 'Ring' | 'Linear'
+  status: string                 // 'Normal' | 'Ring Fault' | ...
+  iosState: string
+  hardwareState: string
+  supervisorMac: string          // this device's supervisor identity
+  supervisorIp: string
+  port1: DlrPort | null
+  port2: DlrPort | null
+  beaconInterval: string         // usec (active supervisor parameters)
+  beaconTimeout: string          // usec
+  dlrVlanId: string
+  precedence: string             // locally configured precedence (255 active / 100 backup)
+  activeSupervisorMac: string    // who is the ring's active supervisor
+  activeSupervisorIp: string
+  redundantGateway: string
+  participants: number | null    // count
+  participantList: DlrParticipant[]
+  ringFaults: number | null
+  lastFaultTime: string
+  faultLocations: DlrFaultLocation[]
+}
 interface EnvInfo {
   temperature: string; powerA: string; powerB: string
 }
@@ -115,6 +149,7 @@ interface SwitchData {
   stpMode: string
   ptpMode: string
   vtpMode: string
+  udld: string           // global UDLD mode (enable/aggressive/...) or 'disabled'
   snmpRo: boolean
   snmpRw: boolean
   snmpEnabled: boolean   // true if either RO or RW community is present
@@ -136,6 +171,10 @@ interface SwitchData {
   catalystEnv: CatalystEnvData | null
   // show interfaces status
   interfaceStatus: InterfaceStatusEntry[]
+  // DLR (Device Level Ring)
+  dlrConfig: DlrRingConfig[]        // global rings + configured mode
+  dlrInterfaces: DlrInterface[]     // interface ↔ ring
+  dlrStatus: DlrRingStatus[]        // show dlr ring (runtime)
   // Existing
   cpuNow: CpuNow | null; processes: ProcessRow[]; memory: MemInfo | null
   gateway: string; vlans: VlanEntry[]
@@ -860,7 +899,12 @@ function parseVersion(text: string) {
 
   const fw  = section.match(/Version\s+([\d.()\w-]+),?\s*RELEASE/i)
              ?? text.match(/Version\s+([\d.()\w-]+),?\s*RELEASE/i)
-  const up  = section.match(/uptime is\s+([^\n]+)/i)
+  // Capture only the duration tokens ("N weeks, N days, ...") — a bare [^\n]+ over-captures
+  // on Word-exported RTF where the whole "show version" sits on one line ("... 22 minutes
+  // Uptime for this control processor is ..."). Fall back to full text when the command was
+  // abbreviated ("sh ver") and there's no scoped section.
+  const upRe = /uptime is\s+(\d+\s+\w+(?:,\s*\d+\s+\w+)*)/i
+  const up  = section.match(upRe) ?? text.match(upRe)
   const rel = section.match(/Last reload reason:\s*([^\n]+)/i)
              ?? text.match(/Last reload reason:\s*([^\n]+)/i)
              ?? section.match(/System returned to ROM by\s+([^\n]+)/i)
@@ -868,18 +912,32 @@ function parseVersion(text: string) {
   const rst = section.match(/System restarted at\s+([^\n]+)/i)
              ?? text.match(/System restarted at\s+([^\n]+)/i)
 
-  // "Model number   : 1783-BMS10CGP"  (IOS 15.x — inside section)
-  // "Model Number   : 1783-MMS10A"    (IOS XE 17.x — may be outside section boundary)
-  // Search section first, fall back to full text
-  const mnM = section.match(/^Model [Nn]umber\s*:\s*(\S+)/im)
-            ?? text.match(/^Model [Nn]umber\s*:\s*(\S+)/im)
+  // Model number — several layouts across IOS / IOS-XE / Stratix and RTF exporters:
+  //   "Model number   : 1783-MS10T"           (IOS 15.x — own line)
+  //   "... Model Number : 1783-MMS10R ..."    (IOS-XE — embedded mid-line in Word-exported RTF)
+  //   "cisco 1783-MS10T (PowerPC405) processor" / "Allen-Bradley 1783-MMS10R (ARM) processor"
+  //   "UDI: PID:1783-MMS10R,SN:..." / "PID: 1783-MS10T , VID: ..."
+  // No '^' anchor, so it also works when the field is mid-line, or when the command was
+  // abbreviated ("sh ver") and there is no "------ show version ------" section header.
+  // "Model Number" won't match "Model Revision Number" (the words must be adjacent).
+  const modelPatterns = [
+    /\bModel [Nn]umber\s*:\s*(\S+)/,
+    /(?:cisco|Allen-Bradley)\s+(\S+)\s+\([^)]*\)\s+processor/i,
+    /\bUDI:\s*PID:\s*(\S+?)\s*,/i,
+    /\bPID:\s*(\S+?)\s*[,)]/i,
+  ]
+  let modelNumber = 'N/A'
+  for (const src of [section, text]) {
+    for (const p of modelPatterns) { const mm = src.match(p); if (mm) { modelNumber = mm[1].trim(); break } }
+    if (modelNumber !== 'N/A') break
+  }
 
   return {
     firmware:     fw  ? fw[1].trim()  : 'N/A',
     uptime:       up  ? up[1].trim()  : 'N/A',
     reloadReason: rel ? rel[1].trim() : 'N/A',
     restartedAt:  rst ? rst[1].trim() : 'N/A',
-    modelNumber:  mnM ? mnM[1].trim() : 'N/A',
+    modelNumber,
   }
 }
 
@@ -906,6 +964,11 @@ function parseRunningConfig(text: string) {
   const stpM  = section.match(/^spanning-tree mode\s+(\S+)/im)
   const ptpM  = section.match(/^ptp mode\s+(\S+)/im)
   const vtpM  = section.match(/^vtp mode\s+(\S+)/im)
+  // UDLD — global "udld <mode>" line (col 0). Ignore "errdisable recovery cause udld"
+  // and interface-level "udld port". Absent → 'disabled'.
+  const udldM = section.match(/^udld\s+(enable|aggressive|disable)\b/im)
+             ?? section.match(/^udld\s+(\S.*?)\s*$/im)
+  const udld  = udldM ? udldM[1].trim() : 'disabled'
   // Fallback: detect STP mode from 'show spanning-tree' output when running-config is absent
   const stpProtoM = !stpM ? text.match(/Spanning tree enabled protocol\s+(\S+)/i) : null
 
@@ -984,6 +1047,7 @@ function parseRunningConfig(text: string) {
              : 'N/A',
     ptpMode:   ptpM ? ptpM[1].trim() : 'N/A',
     vtpMode:   vtpM ? vtpM[1].trim() : 'N/A',
+    udld,
     snmpRo, snmpRw,
     snmpEnabled: snmpRo || snmpRw,
     snmpCommunityRo, snmpCommunityRw,
@@ -1468,6 +1532,113 @@ function ifStatusStyle(status: string): { color: string; fill: boolean; label: s
   return { color: C.textD, fill: false, label: status || '—' }
 }
 
+// Abbreviate a full interface name for compact display (GigabitEthernet1/1 → Gi1/1).
+function shortenIface(name: string): string {
+  return name
+    .replace(/^GigabitEthernet/i, 'Gi').replace(/^TenGigabitEthernet/i, 'Te')
+    .replace(/^FastEthernet/i, 'Fa').replace(/^FortyGigabitEthernet/i, 'Fo')
+    .replace(/^HundredGigE/i, 'Hu').replace(/^AppGigabitEthernet/i, 'Ap')
+    .replace(/^TwentyFiveGigE/i, 'Twe').replace(/^Port-channel/i, 'Po')
+}
+
+// Parse DLR (Device Level Ring) configuration from show running-config:
+//   global rings + their configured mode, and interface → ring assignments.
+//   dlr ring 1            interface GigabitEthernet1/1
+//    mode supervisor        ...
+//     precedence 255        dlr ring 1
+function parseDlr(text: string): { config: DlrRingConfig[]; interfaces: DlrInterface[] } {
+  const cfg = sectionBody(text, /---+\s*show running-config\s*---+/i) || text
+  const rings = new Map<number, string>()          // ring → configured mode
+  const interfaces: DlrInterface[] = []
+  let curIface: string | null = null
+  let curRing: number | null = null
+  for (const raw of cfg.split('\n')) {
+    const line = raw.replace(/\s+$/, '')
+    const ifM = line.match(/^interface\s+(\S+)/i)
+    if (ifM) { curIface = ifM[1]; curRing = null; continue }
+    const gM = line.match(/^dlr ring (\d+)\s*$/i)                 // global ring block (col 0)
+    if (gM) { curRing = parseInt(gM[1]); curIface = null; if (!rings.has(curRing)) rings.set(curRing, ''); continue }
+    const mM = line.match(/^\s+mode\s+(\S+)/i)                    // mode inside a ring block
+    if (mM && curRing !== null) { if (!rings.get(curRing)) rings.set(curRing, mM[1].trim()); continue }
+    const iM = line.match(/^\s+dlr ring (\d+)/i)                  // interface ring assignment
+    if (iM && curIface) { interfaces.push({ iface: shortenIface(curIface), ring: parseInt(iM[1]) }); continue }
+    if (/^\S/.test(line)) curRing = null                         // left the ring block
+  }
+  const config = [...rings.entries()]
+    .map(([ring, mode]) => ({ ring, mode: mode || 'N/A' }))
+    .sort((a, b) => a.ring - b.ring)
+  return { config, interfaces }
+}
+
+// Parse a "Port1/Port2" line that carries vlan + link state, e.g.
+//   "GigabitEthernet1/1, vlan 2074, UP"
+function parseDlrPort(s: string): DlrPort | null {
+  const m = s.match(/(\S+),\s*vlan\s*(\S+),\s*(\S+)/i)
+  return m ? { name: shortenIface(m[1]), vlan: m[2], state: m[3].trim() } : null
+}
+
+// Parse the "show dlr ring" section — one detailed block per ring.
+function parseDlrRing(text: string): DlrRingStatus[] {
+  const sec = sectionBody(text, /---+\s*show dlr ring\s*---+/i)
+  if (!sec) return []
+  const out: DlrRingStatus[] = []
+  const re = /DLR ring (\d+)([\s\S]*?)(?=(?:-{10,}\s*)?DLR ring \d+|$)/gi
+  // Section labels used to bound sub-blocks. Lines are separated by blank lines after RTF
+  // stripping, so sub-blocks must be terminated by the next label — not by a blank line.
+  const END = '(?:Locally Configured|Supervisor DHCP|Ring Protocol|Fault Statistics|Redundant|Backup Supervisor Precedence|$)'
+  let m: RegExpExecArray | null
+  while ((m = re.exec(sec)) !== null) {
+    const ring = parseInt(m[1]); const b = m[2]
+    const grab = (r: RegExp) => { const x = b.match(r); return x ? x[1].trim() : 'N/A' }
+    const num  = (r: RegExp) => { const x = b.match(r); return x ? parseInt(x[1]) : null }
+    const activeParams = (b.match(new RegExp('Active Supervisor Parameters:([\\s\\S]*?)' + END, 'i')) || [])[1] || ''
+    const localParams  = (b.match(new RegExp('Locally Configured Supervisor Parameters:([\\s\\S]*?)' + END, 'i')) || [])[1] || ''
+    const ag = (src: string, r: RegExp) => { const x = src.match(r); return x ? x[1].trim() : 'N/A' }
+
+    // Ring participants (only present on the active supervisor)
+    const participantList: DlrParticipant[] = []
+    const pm = b.match(/Ring Protocol Participants Count:\s*\d+([\s\S]*?)(?:Fault Statistics|Redundant|Backup Supervisor Precedence|$)/i)
+    if (pm) for (const row of pm[1].split('\n')) {
+      const r = row.match(/^\s*(\d+)\s+([0-9A-Fa-f:]{17})\s+(\d+\.\d+\.\d+\.\d+)/)
+      if (r) participantList.push({ no: +r[1], mac: r[2], ip: r[3] })
+    }
+    // Fault locations (last active node on each port)
+    const faultLocations: DlrFaultLocation[] = []
+    const fm = b.match(/Ring Fault Location([\s\S]*?)(?:Redundant|Backup Supervisor Precedence|-{10,}|$)/i)
+    if (fm) for (const row of fm[1].split('\n')) {
+      const r = row.match(/^(Last Active Node on Port \d+)\s+([0-9A-Fa-f:]{17})\s+(\d+\.\d+\.\d+\.\d+)/)
+      if (r) faultLocations.push({ label: r[1].trim(), mac: r[2], ip: r[3] })
+    }
+
+    out.push({
+      ring,
+      mode:                grab(/^\s*mode:\s*(.+?)\s*$/im),
+      topology:            grab(/Network Topology:\s*(\S+)/i),
+      status:              grab(/Network Status:\s*(\S+)/i),
+      iosState:            grab(/IOS state:\s*(\S+)/i),
+      hardwareState:       grab(/Hardware State:\s*(\S+)/i),
+      supervisorMac:       grab(/Mac-Addr:\s*([0-9A-Fa-f:]{17})/i),
+      supervisorIp:        grab(/IP-Addr:\s*(\d+\.\d+\.\d+\.\d+)/i),
+      port1:               parseDlrPort((b.match(/Port1:\s*([^\n]*?,\s*vlan[^\n]*)/i) || [])[1] || ''),
+      port2:               parseDlrPort((b.match(/Port2:\s*([^\n]*?,\s*vlan[^\n]*)/i) || [])[1] || ''),
+      beaconInterval:      ag(activeParams, /Beacon Interval \(usec\):\s*(\d+)/i),
+      beaconTimeout:       ag(activeParams, /Beacon Timeout \(usec\):\s*(\d+)/i),
+      dlrVlanId:           ag(activeParams, /DLR VLAN ID:\s*(\d+)/i),
+      precedence:          ag(localParams,  /Precedence:\s*(\d+)/i),
+      activeSupervisorMac: ag(activeParams, /Mac-Addr:\s*([0-9A-Fa-f:]{17})/i),
+      activeSupervisorIp:  ag(activeParams, /IP-Addr:\s*(\d+\.\d+\.\d+\.\d+)/i),
+      redundantGateway:    grab(/Redundant Gateway Status:\s*(.+?)\s*$/im),
+      participants:        num(/Ring Protocol Participants Count:\s*(\d+)/i),
+      participantList,
+      ringFaults:          num(/Ring Faults since power up:\s*(\d+)/i),
+      lastFaultTime:       grab(/Time of last fault:\s*(.+?)\s*$/im),
+      faultLocations,
+    })
+    if (m.index === re.lastIndex) re.lastIndex++
+  }
+  return out
+}
+
 // Parse a single Cisco CPU-history ASCII chart block.
 //
 // Cisco encodes the EXACT per-bucket maximum as digits stacked VERTICALLY above each
@@ -1597,17 +1768,27 @@ function _parseTimestampMs(ts: string): number {
 //     "Dec  7 12:25:20.341 BRA: NTP Core (INFO): 172.16.4.1 ..."
 //
 // The optional group (?:\s+[a-zA-Z]{2,5})? captures tz in both cases (bra, BRA, utc, UTC).
-const _LOG_RE = /^[*]?(\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}(?:\.\d+)?)(?:\s+[a-zA-Z]{2,5})?: %([A-Z0-9_]+)-(\d)-([A-Z0-9_]+): (.+)$/gm
+// Optional leading "NNNNNN: " is a log-buffer sequence number (service sequence-numbers /
+// IOS log buffer dumps). Without allowing it, sequence-numbered buffers matched ZERO lines.
+const _LOG_RE = /^(?:\d+:\s+)?[*]?(\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}(?:\.\d+)?)(?:\s+[a-zA-Z]{2,5})?: %([A-Z0-9_]+)-(\d)-([A-Z0-9_]+): (.+)$/gm
 
 // Format B: "CATEGORY (LEVEL): message" — used by some IOS platforms (e.g. NTP Core events).
 // Only matched on lines NOT already captured by _LOG_RE (deduplication in parseLogEntries).
-const _LOG_RE2 = /^[*]?(\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}(?:\.\d+)?)\s+[a-zA-Z]{2,5}:\s+([A-Za-z][A-Za-z0-9 _\/-]+?)\s*\(([A-Z]+)\):\s*(.+)$/gm
+const _LOG_RE2 = /^(?:\d+:\s+)?[*]?(\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}(?:\.\d+)?)\s+[a-zA-Z]{2,5}:\s+([A-Za-z][A-Za-z0-9 _\/-]+?)\s*\(([A-Z]+)\):\s*(.+)$/gm
 
 // Map text severity level to Cisco numeric severity (0=Emergency ... 7=Debug)
 const _LEVEL_SEV: Record<string, number> = {
   EMERGENCY:0, ALERT:1, CRITICAL:2, ERROR:3,
   WARNING:4,   NOTICE:5, INFO:6,    DEBUG:7,
   WARN:4,      CRIT:2,   ERR:3,
+}
+
+// Terminal captures hard-wrap long log lines by inserting a run of padding spaces at the
+// wrap column (all on one physical line), which truncates the message tail. Cisco syslog
+// text never contains runs of 2+ spaces, so collapsing them rejoins the wrapped fragment
+// (e.g. "GigabitEthernet1" + spaces + "/8, changed ..." → "GigabitEthernet1/8, changed ...").
+function _unwrapMsg(msg: string): string {
+  return msg.replace(/ {2,}/g, '').trim()
 }
 
 function parseLogEntries(text: string, hostname: string, color: string): LogEntry[] {
@@ -1633,7 +1814,7 @@ function parseLogEntries(text: string, hostname: string, color: string): LogEntr
       raw: m[0], timestamp: m[1].trim(),
       timestampMs: _parseTimestampMs(m[1]),
       facility: m[2], severity: parseInt(m[3]),
-      mnemonic: m[4], message: m[5].trim(),
+      mnemonic: m[4], message: _unwrapMsg(m[5]),
       sourceHostname: hostname, sourceColor: color,
     })
   }
@@ -1651,7 +1832,7 @@ function parseLogEntries(text: string, hostname: string, color: string): LogEntr
       raw: m2[0], timestamp: m2[1].trim(),
       timestampMs: _parseTimestampMs(m2[1]),
       facility: m2[2].trim(), severity: sev,
-      mnemonic: level, message: m2[4].trim(),
+      mnemonic: level, message: _unwrapMsg(m2[4]),
       sourceHostname: hostname, sourceColor: color,
     })
   }
@@ -1681,9 +1862,9 @@ function buildNetIntel(switches: (SwitchData & { _logEntries?: LogEntry[] })[]):
       (e.facility === 'LINK'      && e.mnemonic === 'UPDOWN') ||
       (e.facility === 'LINEPROTO' && e.mnemonic === 'UPDOWN')
     if (!isFlap) continue
-    const ifM = e.message.match(/Interface\s+(\S+?)[,\s]/i)
-    if (!ifM) continue
-    const key = `${e.sourceHostname}::${ifM[1]}`
+    const iface = logIface(e.message)
+    if (!iface) continue
+    const key = `${e.sourceHostname}::${iface}`
     const arr = flapMap.get(key) ?? []
     arr.push(e)
     flapMap.set(key, arr)
@@ -1736,7 +1917,7 @@ function parseCisco(raw: string, filename: string): SwitchData {
   const { gateway, vlans }   = parseNetwork(text)
   const { cpuSec, cpuMin, cpuHour, cpuHistoryRaw } = parseCpuHistory(text)
   const {
-    stpMode, ptpMode, vtpMode,
+    stpMode, ptpMode, vtpMode, udld,
     snmpRo, snmpRw, snmpEnabled, snmpCommunityRo, snmpCommunityRw,
     vtyBlocks, ntpServers, usernames,
   } = parseRunningConfig(text)
@@ -1744,7 +1925,7 @@ function parseCisco(raw: string, filename: string): SwitchData {
   const result: SwitchData & { _logEntries?: LogEntry[] } = {
     filename, firmware, uptime, reloadReason, restartedAt, modelNumber,
     gateway, vlans, cpuSec, cpuMin, cpuHour, cpuHistoryRaw,
-    stpMode, ptpMode, vtpMode,
+    stpMode, ptpMode, vtpMode, udld,
     snmpRo, snmpRw, snmpEnabled, snmpCommunityRo, snmpCommunityRw,
     vtyBlocks, ntpServers, usernames,
     hostname,
@@ -1766,6 +1947,8 @@ function parseCisco(raw: string, filename: string): SwitchData {
     macPerVlan:        parseMacPerVlan(text),
     catalystEnv:       parseCatalystEnv(text),
     interfaceStatus:   parseInterfaceStatus(text),
+    ...(() => { const d = parseDlr(text); return { dlrConfig: d.config, dlrInterfaces: d.interfaces } })(),
+    dlrStatus:         parseDlrRing(text),
   }
   result._logEntries = parseLogEntries(text, hostname, '')
 
@@ -1885,6 +2068,7 @@ function parseModicon(raw: string, filename: string): SwitchData {
     stpMode,
     ptpMode,
     vtpMode:           'N/A',    // VTP is Cisco-only
+    udld:              'disabled',
     snmpRo, snmpRw, snmpEnabled, snmpCommunityRo, snmpCommunityRw,
     vtyBlocks,
     ntpServers,
@@ -1901,6 +2085,9 @@ function parseModicon(raw: string, filename: string): SwitchData {
     env:               null,
     catalystEnv:       null,
     interfaceStatus:   [],
+    dlrConfig:         [],
+    dlrInterfaces:     [],
+    dlrStatus:         [],
     processes:         [],
     stpTopo:           [],
     stpVlans:          [],
@@ -2413,6 +2600,9 @@ function AnalyticsPanel({ switches }: { switches: SwitchData[] }) {
     return { sw, cpuMaxHour, cpuAvgHour, critHours, alerts }
   })
 
+  // DLR columns only appear when at least one switch in the fleet uses DLR.
+  const hasDlr = switches.some(sw => sw.dlrConfig.length > 0 || sw.dlrStatus.length > 0)
+
   // Global KPIs
   const totalAlerts  = rows.reduce((s, r) => s + r.alerts.length, 0)
   const avgCpu       = rows.filter((r) => r.sw.cpuNow).length
@@ -2510,6 +2700,13 @@ function AnalyticsPanel({ switches }: { switches: SwitchData[] }) {
                 <TH>VTP Mode</TH>
                 <TH>PTP Mode</TH>
                 <TH>Acesso</TH>
+                {hasDlr && <>
+                  <TH>DLR Ring</TH>
+                  <TH>DLR Mode</TH>
+                  <TH>DLR Interfaces</TH>
+                  <TH>DLR Status</TH>
+                </>}
+                <TH>UDLD</TH>
                 <TH>Interrup.</TH>
                 <TH>CPU 5min</TH>
                 <TH>Mem%</TH>
@@ -2580,6 +2777,59 @@ function AnalyticsPanel({ switches }: { switches: SwitchData[] }) {
                           {acc.snmp   && <Badge label="SNMP"   color={C.blue} />}
                         </div>
                       ) : <span style={{ fontSize: 9, color: C.textG, fontFamily: C.mono }}>—</span>}
+                    </td>
+                    {hasDlr && <>
+                      {/* DLR Ring */}
+                      <td style={{ padding: '8px 12px', borderBottom: `1px solid ${C.border}`, whiteSpace: 'nowrap' }}>
+                        {sw.dlrConfig.length || sw.dlrStatus.length
+                          ? <span style={{ fontFamily: C.mono, fontWeight: 700, color: C.purple }}>
+                              {(sw.dlrConfig.length ? sw.dlrConfig.map(r => r.ring) : sw.dlrStatus.map(r => r.ring)).join(', ')}
+                            </span>
+                          : <span style={{ fontSize: 9, color: C.textG, fontFamily: C.mono }}>—</span>}
+                      </td>
+                      {/* DLR Mode (config) */}
+                      <td style={{ padding: '8px 12px', borderBottom: `1px solid ${C.border}`, whiteSpace: 'nowrap' }}>
+                        {sw.dlrConfig.length
+                          ? (() => {
+                              const modes = [...new Set(sw.dlrConfig.map(r => r.mode))]
+                              return <span style={{ fontFamily: C.mono, color: C.textD }}>
+                                {modes.length === 1 ? modes[0] : sw.dlrConfig.map(r => `R${r.ring}:${r.mode}`).join(', ')}
+                              </span>
+                            })()
+                          : <span style={{ fontSize: 9, color: C.textG, fontFamily: C.mono }}>—</span>}
+                      </td>
+                      {/* DLR Interfaces por anel */}
+                      <td style={{ padding: '8px 12px', borderBottom: `1px solid ${C.border}` }}>
+                        {sw.dlrInterfaces.length
+                          ? (() => {
+                              const byRing = new Map<number, string[]>()
+                              sw.dlrInterfaces.forEach(i => { const a = byRing.get(i.ring) ?? []; a.push(i.iface); byRing.set(i.ring, a) })
+                              return <span style={{ fontSize: 9, fontFamily: C.mono, color: C.textD }}>
+                                {[...byRing.entries()].sort((a, b) => a[0] - b[0]).map(([r, ifs]) => `R${r}: ${ifs.join(', ')}`).join('   ·   ')}
+                              </span>
+                            })()
+                          : <span style={{ fontSize: 9, color: C.textG, fontFamily: C.mono }}>—</span>}
+                      </td>
+                      {/* DLR Status (show dlr ring) */}
+                      <td style={{ padding: '8px 12px', borderBottom: `1px solid ${C.border}` }}>
+                        {sw.dlrStatus.length
+                          ? <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+                              {sw.dlrStatus.map(s => {
+                                const ok = /normal/i.test(s.status)
+                                const modeColor = /active/i.test(s.mode) ? C.green : /backup/i.test(s.mode) ? C.orange : C.textD
+                                return <div key={s.ring} style={{ fontSize: 9, fontFamily: C.mono, whiteSpace: 'nowrap' }}>
+                                  <span style={{ color: C.purple, fontWeight: 700 }}>R{s.ring}</span>{' '}
+                                  <span style={{ color: modeColor }}>{s.mode}</span>{' · '}
+                                  <span style={{ color: C.textD }}>{s.topology}</span>{' · '}
+                                  <span style={{ color: ok ? C.green : C.red, fontWeight: 700 }}>{s.status}</span>
+                                </div>
+                              })}
+                            </div>
+                          : <span style={{ fontSize: 9, color: C.textG, fontFamily: C.mono }}>—</span>}
+                      </td>
+                    </>}
+                    <td style={{ padding: '8px 12px', borderBottom: `1px solid ${C.border}` }}>
+                      <Badge label={sw.udld} color={/disable/i.test(sw.udld) ? C.textD : C.green} />
                     </td>
                     <TD warn={!!(cpu && cpu.interrupt > 5)}>
                       {cpu ? `${cpu.interrupt}%` : '—'}
@@ -2687,6 +2937,7 @@ function buildWorksheet(sw: SwitchData, sheetName?: string): string {
   rows.push(xlRow(xlCell('Spanning Tree Mode'), xlCell(sw.stpMode)))
   rows.push(xlRow(xlCell('VTP Mode'),           xlCell(sw.vtpMode)))
   rows.push(xlRow(xlCell('PTP Mode'),           xlCell(sw.ptpMode)))
+  rows.push(xlRow(xlCell('UDLD'),               xlCell(sw.udld)))
   const xlVtyInputs = sw.vtyBlocks.filter(v => !v.isCon).map(v => v.transportInput.toLowerCase())
   const xlHasSsh    = xlVtyInputs.length === 0 || xlVtyInputs.some(s => /\b(ssh|all)\b/.test(s))
   const xlHasTelnet = xlVtyInputs.length === 0 || xlVtyInputs.some(s => /\b(telnet|all)\b/.test(s))
@@ -2895,6 +3146,59 @@ function buildWorksheet(sw: SwitchData, sheetName?: string): string {
     rows.push(`<Row ss:AutoFitHeight="1"/>`)
   }
 
+  // ── DLR (Device Level Ring) ───────────────────────────────────────────────
+  if (sw.dlrStatus.length > 0 || sw.dlrConfig.length > 0) {
+    const dlrRings = [...new Set([...sw.dlrStatus.map(s => s.ring), ...sw.dlrConfig.map(c => c.ring)])].sort((a, b) => a - b)
+    rows.push(xlSectionRow('DLR — show dlr ring / running-config', 17))
+    rows.push(xlRow(
+      xlHeader('Ring'), xlHeader('Mode (config)'), xlHeader('Mode (runtime)'),
+      xlHeader('Topology'), xlHeader('Status'), xlHeader('IOS State'), xlHeader('HW State'),
+      xlHeader('Supervisor IP'), xlHeader('Supervisor Ativo IP'),
+      xlHeader('Port1'), xlHeader('Port2'),
+      xlHeader('Beacon Int/Timeout (µs)'), xlHeader('DLR VLAN'), xlHeader('Precedence'),
+      xlHeader('Redundant GW'), xlHeader('Participantes'), xlHeader('Ring Faults'),
+    ))
+    dlrRings.forEach(ring => {
+      const st  = sw.dlrStatus.find(s => s.ring === ring)
+      const cfg = sw.dlrConfig.find(c => c.ring === ring)
+      const faultWarn = !!(st && st.ringFaults)
+      const statusWarn = !!(st && !/normal/i.test(st.status))
+      const fmtPort = (p: DlrPort | null) => p ? `${p.name} (vlan ${p.vlan}, ${p.state})` : '—'
+      rows.push(xlRow(
+        xlCell(String(ring)),
+        xlCell(cfg ? cfg.mode : 'N/A'),
+        xlCell(st ? st.mode : 'N/A'),
+        xlCell(st ? st.topology : 'N/A'),
+        xlWarnCell(st ? st.status : 'N/A', statusWarn),
+        xlCell(st ? st.iosState : 'N/A'),
+        xlCell(st ? st.hardwareState : 'N/A'),
+        xlCell(st ? st.supervisorIp : 'N/A'),
+        xlCell(st ? st.activeSupervisorIp : 'N/A'),
+        xlCell(st ? fmtPort(st.port1) : '—'),
+        xlCell(st ? fmtPort(st.port2) : '—'),
+        xlCell(st ? `${st.beaconInterval} / ${st.beaconTimeout}` : 'N/A'),
+        xlCell(st ? st.dlrVlanId : 'N/A'),
+        xlCell(st ? st.precedence : 'N/A'),
+        xlCell(st ? st.redundantGateway : 'N/A'),
+        xlCell(st && st.participants !== null ? String(st.participants) : '—'),
+        xlWarnCell(st && st.ringFaults !== null ? String(st.ringFaults) : '—', faultWarn),
+      ))
+    })
+    rows.push(`<Row ss:AutoFitHeight="1"/>`)
+    // Interfaces por anel + participantes (detalhe)
+    dlrRings.forEach(ring => {
+      const st  = sw.dlrStatus.find(s => s.ring === ring)
+      const ifs = sw.dlrInterfaces.filter(i => i.ring === ring).map(i => i.iface).join(', ')
+      if (ifs) rows.push(xlRow(xlCell(`Ring ${ring} — Interfaces (config)`), xlCell(ifs)))
+      if (st && st.lastFaultTime !== 'N/A') rows.push(xlRow(xlCell(`Ring ${ring} — Última falha`), xlCell(st.lastFaultTime)))
+      if (st && st.participantList.length > 0) {
+        rows.push(xlRow(xlCell(`Ring ${ring} — Participantes (${st.participantList.length})`), xlHeader('MAC-Addr'), xlHeader('IP-Addr')))
+        st.participantList.forEach(p => rows.push(xlRow(xlCell(`  ${p.no}`), xlCell(p.mac), xlCell(p.ip))))
+      }
+    })
+    rows.push(`<Row ss:AutoFitHeight="1"/>`)
+  }
+
   // ── SFP Inventory ────────────────────────────────────────────────────────
   if (sw.sfpInventory.length > 0) {
     rows.push(xlSectionRow('Inventário SFP — show inventory', 4))
@@ -2925,13 +3229,14 @@ function buildWorksheet(sw: SwitchData, sheetName?: string): string {
   // ── Logs — show logging (eventos deste switch) ───────────────────────────
   const swLogs: LogEntry[] = ((sw as any)._logEntries ?? []) as LogEntry[]
   if (swLogs.length > 0) {
-    rows.push(xlSectionRow('Logs — show logging', 5))
-    rows.push(xlRow(xlHeader('Timestamp'), xlHeader('Severidade'), xlHeader('Facility'), xlHeader('Mnemonic'), xlHeader('Mensagem')))
+    rows.push(xlSectionRow('Logs — show logging', 6))
+    rows.push(xlRow(xlHeader('Timestamp'), xlHeader('Severidade'), xlHeader('Interface'), xlHeader('Facility'), xlHeader('Mnemonic'), xlHeader('Mensagem')))
     swLogs.forEach(e => {
       const isCrit = e.severity <= 3
       rows.push(xlRow(
         xlCell(e.timestamp),
         xlWarnCell(`${e.severity} — ${sevLabel(e.severity)}`, isCrit),
+        xlCell(logIface(e.message) || '—'),
         xlCell(e.facility),
         xlCell(e.mnemonic),
         xlCell(e.message),
@@ -2959,14 +3264,17 @@ function buildWorksheet(sw: SwitchData, sheetName?: string): string {
 
 function buildAnalyticsWorksheet(switches: SwitchData[]): string {
   const rows: string[] = []
-  // 17 columns: hostname, model, firmware, uptime, reload, stp, vtp, ptp,
-  //             acesso, intr, cpu5m, mem%, temp, statusTemp, psa, psb, alerts
-  rows.push(xlSectionRow('Analytics — Visão Geral dos Switches', 17))
+  // 21 columns: hostname, model, firmware, uptime, reload, stp, vtp, ptp, acesso,
+  //             dlrRing, dlrModeCfg, dlrIfaces, dlrStatus,
+  //             intr, cpu5m, mem%, temp, statusTemp, psa, psb, alerts
+  rows.push(xlSectionRow('Analytics — Visão Geral dos Switches', 22))
   rows.push(xlRow(
     xlHeader('Switch'), xlHeader('Modelo'), xlHeader('Firmware'),
     xlHeader('Uptime'), xlHeader('Último Reload'),
     xlHeader('STP Mode'), xlHeader('VTP Mode'), xlHeader('PTP Mode'),
     xlHeader('Acesso'),
+    xlHeader('DLR Ring'), xlHeader('DLR Mode (cfg)'), xlHeader('DLR Interfaces'), xlHeader('DLR Status'),
+    xlHeader('UDLD'),
     xlHeader('Interrup. (%)'), xlHeader('CPU 5min (%)'),
     xlHeader('Mem. Uso (%)'), xlHeader('Temperatura'), xlHeader('Status Temp.'),
     xlHeader('PS-A'), xlHeader('PS-B'), xlHeader('Alertas'),
@@ -3014,6 +3322,21 @@ function buildAnalyticsWorksheet(switches: SwitchData[]): string {
     const accStr = accParts.length ? accParts.join(', ') : '—'
     const accWarn = accParts.includes('Telnet')   // Telnet em texto claro = risco
 
+    // DLR — consolidado por coluna
+    const dlrRings = [...new Set([...sw.dlrStatus.map(s => s.ring), ...sw.dlrConfig.map(c => c.ring)])].sort((a, b) => a - b)
+    const dlrRingStr = dlrRings.length ? dlrRings.join(', ') : '—'
+    const dlrModes = [...new Set(sw.dlrConfig.map(c => c.mode))]
+    const dlrModeStr = sw.dlrConfig.length ? (dlrModes.length === 1 ? dlrModes[0] : sw.dlrConfig.map(c => `R${c.ring}:${c.mode}`).join(' ')) : '—'
+    const dlrIfByRing = new Map<number, string[]>()
+    sw.dlrInterfaces.forEach(i => { const a = dlrIfByRing.get(i.ring) ?? []; a.push(i.iface); dlrIfByRing.set(i.ring, a) })
+    const dlrIfStr = sw.dlrInterfaces.length
+      ? [...dlrIfByRing.entries()].sort((a, b) => a[0] - b[0]).map(([r, ifs]) => `R${r}: ${ifs.join(', ')}`).join(' | ')
+      : '—'
+    const dlrStatusStr = sw.dlrStatus.length
+      ? sw.dlrStatus.map(s => `R${s.ring}: ${s.mode} / ${s.topology} / ${s.status}`).join(' | ')
+      : '—'
+    const dlrStatusWarn = sw.dlrStatus.some(s => !/normal/i.test(s.status))
+
     rows.push(xlRow(
       xlCell(sw.hostname),
       xlCell(sw.modelNumber),
@@ -3024,6 +3347,11 @@ function buildAnalyticsWorksheet(switches: SwitchData[]): string {
       xlCell(sw.vtpMode),
       xlCell(sw.ptpMode),
       xlWarnCell(accStr, accWarn),
+      xlCell(dlrRingStr),
+      xlCell(dlrModeStr),
+      xlCell(dlrIfStr),
+      xlWarnCell(dlrStatusStr, dlrStatusWarn),
+      xlCell(sw.udld),
       cpu ? xlCpuPct(cpu.interrupt, cpu.interrupt > 5) : xlCell('—'),
       cpu ? xlCpuPct(cpu.fiveMin,  false)              : xlCell('—'),
       mem ? xlCpuPct(mem.pct, mem.pct > 80)            : xlCell('—'),
@@ -3043,6 +3371,18 @@ function buildAnalyticsWorksheet(switches: SwitchData[]): string {
   </Worksheet>`
 }
 
+// Extract the interface/port referenced in a log message, e.g.
+//   "Interface GigabitEthernet1/8, changed state to up" → "GigabitEthernet1/8"
+//   "Clear counter on interface Gi1/2"                  → "Gi1/2"
+//   "Line protocol on Interface Vlan114, ..."           → "Vlan114"
+// Returns '' when the message references no interface (NTP, CONFIG_I, etc.).
+// The token stops at the valid end of an interface name (Type+slot/port) so a terminal
+// wrap that merged a following word (e.g. "...Gi1/2by console") still yields "Gi1/2".
+function logIface(msg: string): string {
+  const m = msg.match(/\binterface\s+([A-Za-z][A-Za-z-]*\d[\d/]*)/i)
+  return m ? m[1] : ''
+}
+
 // ── Timeline worksheet — todos os logs de todos os switches cronologicamente
 function buildTimelineWorksheet(switches: SwitchData[]): string {
   const allLogs: LogEntry[] = []
@@ -3055,9 +3395,9 @@ function buildTimelineWorksheet(switches: SwitchData[]): string {
   if (allLogs.length === 0) return ''
 
   const rows: string[] = []
-  rows.push(xlSectionRow('Linha do Tempo Global — show logging (todos os switches)', 6))
+  rows.push(xlSectionRow('Linha do Tempo Global — show logging (todos os switches)', 7))
   rows.push(xlRow(
-    xlHeader('Timestamp'), xlHeader('Severidade'), xlHeader('Switch'),
+    xlHeader('Timestamp'), xlHeader('Severidade'), xlHeader('Switch'), xlHeader('Interface'),
     xlHeader('Facility'), xlHeader('Mnemonic'), xlHeader('Mensagem'),
   ))
   allLogs.forEach(e => {
@@ -3066,6 +3406,7 @@ function buildTimelineWorksheet(switches: SwitchData[]): string {
       xlCell(e.timestamp),
       xlWarnCell(`${e.severity} — ${sevLabel(e.severity)}`, isCrit),
       xlCell(e.sourceHostname),
+      xlCell(logIface(e.message) || '—'),
       xlCell(e.facility),
       xlCell(e.mnemonic),
       xlCell(e.message),
@@ -3107,9 +3448,9 @@ function buildTimelineWorksheet(switches: SwitchData[]): string {
     const isFlap = (e.facility === 'LINK' && e.mnemonic === 'UPDOWN') ||
                    (e.facility === 'LINEPROTO' && e.mnemonic === 'UPDOWN')
     if (!isFlap) continue
-    const ifM = e.message.match(/Interface\s+(\S+?)[,\s]/i)
-    if (!ifM) continue
-    const key = `${e.sourceHostname}::${ifM[1]}`
+    const iface = logIface(e.message)
+    if (!iface) continue
+    const key = `${e.sourceHostname}::${iface}`
     const arr = flapMap.get(key) ?? []; arr.push(e); flapMap.set(key, arr)
   }
   const flaps: { iface: string; hostname: string; count: number }[] = []
@@ -3412,7 +3753,7 @@ function exportToWord(switches: SwitchData[], netIntel: NetIntel) {
           <tr><td class="lbl" style="width:45%">Data da Extração</td><td>${esc(dateStr)} — ${esc(timeStr)}</td></tr>
           <tr><td class="lbl">Switches Analisados</td><td><strong>${switches.length}</strong></td></tr>
           <tr><td class="lbl">Health Score Médio</td><td><strong style="color:${scoreColor(avgScore)}">${avgScore}/100 — ${esc(scoreLabel(avgScore))}</strong></td></tr>
-          <tr><td class="lbl">Gerado por</td><td>Network Topology Analyzer</td></tr>
+          <tr><td class="lbl">Gerado por</td><td>Netwatch Analyzer</td></tr>
         </table>
         <p style="font-size:7.5pt;color:${CLR.gray50};margin-top:20pt">
           Documento CONFIDENCIAL — uso restrito ao cliente destinatário.<br>
@@ -3690,6 +4031,7 @@ function exportToWord(switches: SwitchData[], netIntel: NetIntel) {
       body.push(kvTable([
         ['STP Mode',   esc(sw.stpMode)],
         ['VTP Mode',   esc(sw.vtpMode)],
+        ['UDLD',       /disable/i.test(sw.udld) ? badge('disabled', 'n') : badge(esc(sw.udld), 'g')],
         ['SSH',        hasSsh_    ? badge('Habilitado', 'g') : badge('Desabilitado', 'n')],
         ['Telnet',     hasTelnet_ ? badge('ATENÇÃO — Habilitado', 'r') : badge('Desabilitado', 'g')],
         ['SNMP',       sw.snmpEnabled
@@ -3700,6 +4042,43 @@ function exportToWord(switches: SwitchData[], netIntel: NetIntel) {
           ? esc((sw.ntpServers ?? []).map(n => n.address + (n.preferred ? ' ★' : '')).join(', '))
           : badge('Não configurado', 'o')],
       ]))
+
+      // DLR (Device Level Ring)
+      if (sw.dlrStatus.length > 0 || sw.dlrConfig.length > 0) {
+        const dlrRings = [...new Set([...sw.dlrStatus.map(s => s.ring), ...sw.dlrConfig.map(c => c.ring)])].sort((a, b) => a - b)
+        body.push(`<h4>DLR — Device Level Ring</h4>`)
+        body.push(`<table style="font-size:7.5pt">
+          <thead>${thRow('Ring', 'Mode (cfg)', 'Mode (runtime)', 'Status', 'Sup. IP', 'Sup. Ativo IP', 'Port1 / Port2', 'Beacon (µs)', 'Prec.', 'Part.', 'Faults', 'Última Falha')}</thead>
+          <tbody>${dlrRings.map(ring => {
+            const st  = sw.dlrStatus.find(s => s.ring === ring)
+            const cfg = sw.dlrConfig.find(c => c.ring === ring)
+            const stOk = !st || /normal/i.test(st.status)
+            const fmtP = (p: DlrPort | null) => p ? `${p.name} (${p.vlan}/${p.state})` : '—'
+            return `<tr>
+              <td><strong>${ring}</strong></td>
+              <td class="dim">${esc(cfg ? cfg.mode : 'N/A')}</td>
+              <td>${esc(st ? st.mode : 'N/A')}</td>
+              <td class="${stOk ? 'ok' : 'warn'}">${esc(st ? st.status : 'N/A')}</td>
+              <td class="dim">${esc(st ? st.supervisorIp : 'N/A')}</td>
+              <td class="dim">${esc(st ? st.activeSupervisorIp : 'N/A')}</td>
+              <td class="dim">${esc(st ? `${fmtP(st.port1)} / ${fmtP(st.port2)}` : 'N/A')}</td>
+              <td class="dim">${esc(st ? `${st.beaconInterval}/${st.beaconTimeout}` : 'N/A')}</td>
+              <td class="dim">${esc(st ? st.precedence : 'N/A')}</td>
+              <td>${st && st.participants !== null ? st.participants : '—'}</td>
+              <td class="${st && st.ringFaults ? 'warn' : 'dim'}">${st && st.ringFaults !== null ? st.ringFaults : '—'}</td>
+              <td class="dim">${esc(st && st.lastFaultTime !== 'N/A' ? st.lastFaultTime : '—')}</td>
+            </tr>`
+          }).join('')}</tbody>
+        </table>`)
+        // Interfaces por anel (config)
+        const dlrIfLines = dlrRings.map(ring => {
+          const ifs = sw.dlrInterfaces.filter(i => i.ring === ring).map(i => i.iface).join(', ')
+          return ifs ? `Ring ${ring}: ${ifs}` : ''
+        }).filter(Boolean)
+        if (dlrIfLines.length > 0) {
+          body.push(`<p style="font-size:7.5pt;margin:2pt 0"><span class="dim">Interfaces DLR (config):</span> ${esc(dlrIfLines.join('  ·  '))}</p>`)
+        }
+      }
 
       // Network
       if (sw.vlans.length > 0) {
@@ -3860,7 +4239,7 @@ function exportToWord(switches: SwitchData[], netIntel: NetIntel) {
   </table>`)
 
   body.push(`<p style="margin-top:20pt;font-size:7.5pt;color:${CLR.gray50};text-align:center">
-    Documento gerado automaticamente — Network Topology Analyzer &nbsp;|&nbsp; ${esc(dateStr)} ${esc(timeStr)}<br>
+    Documento gerado automaticamente — Netwatch Analyzer &nbsp;|&nbsp; ${esc(dateStr)} ${esc(timeStr)}<br>
     Referências: tools.cisco.com/bugsearch &nbsp;|&nbsp; Cisco TAC: 1-800-553-2447 &nbsp;|&nbsp; IEC 62443 &nbsp;|&nbsp; Rockwell Automation Product Life Cycle
   </p>`)
 
@@ -4287,7 +4666,7 @@ function SecurityView({ netIntel }: { netIntel: NetIntel }) {
 }
 
 // ─── Main Component ───────────────────────────────────────────────────────
-type TabId     = 'cpu' | 'memory' | 'network' | 'env' | 'stp' | 'config' | 'interfaces' | 'inventory'
+type TabId     = 'cpu' | 'memory' | 'network' | 'env' | 'stp' | 'config' | 'dlr' | 'interfaces' | 'inventory'
 type ViewMode  = 'detail' | 'analytics' | 'timeline' | 'security'
 
 const TABS: { id: TabId; icon: string; label: string }[] = [
@@ -4297,6 +4676,7 @@ const TABS: { id: TabId; icon: string; label: string }[] = [
   { id: 'env',       icon: '🌡️', label: 'Ambiente'   },
   { id: 'stp',       icon: '🌲', label: 'STP'        },
   { id: 'config',    icon: '⚙️', label: 'Configuração' },
+  { id: 'dlr',       icon: '⭕', label: 'DLR' },
   { id: 'interfaces', icon: '🔗', label: 'Interfaces' },
   { id: 'inventory', icon: '🔌', label: 'Inventário' },
 ]
@@ -4365,7 +4745,7 @@ export default function ShowtechView() {
 
   const openFilePicker = () => {
     const inp = document.createElement('input')
-    inp.type = 'file'; inp.multiple = true; inp.accept = '.rtf,.txt,.log'
+    inp.type = 'file'; inp.multiple = true; inp.accept = '.rtf,.txt,.log,.doc,.docx'
     inp.onchange = (e) => {
       const f = (e.target as HTMLInputElement).files
       if (f?.length) processFiles(f)
@@ -5399,6 +5779,7 @@ export default function ShowtechView() {
                                 { label: 'Spanning Tree Mode', value: sw.stpMode, color: C.blue   },
                                 { label: 'VTP Mode',           value: sw.vtpMode, color: C.purple },
                                 { label: 'PTP Mode',           value: sw.ptpMode, color: C.cyan   },
+                                { label: 'UDLD',               value: sw.udld,    color: /disable/i.test(sw.udld) ? C.textD : C.green },
                               ].map(item => (
                                 <div key={item.label} style={{ padding: '12px 14px', background: C.surface, border: `1px solid ${C.border}`, borderRadius: 6 }}>
                                   <p style={{ fontSize: 8, fontFamily: C.mono, textTransform: 'uppercase', letterSpacing: '0.12em', color: C.textG, margin: '0 0 8px' }}>{item.label}</p>
@@ -5761,6 +6142,158 @@ export default function ShowtechView() {
                             </div>
                           )}
 
+                        </div>
+                      )}
+
+                      {/* ── DLR (Device Level Ring) ───────────────────── */}
+                      {tab === 'dlr' && (
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+                          {(sw.dlrStatus.length > 0 || sw.dlrConfig.length > 0) ? (
+                            <Panel icon="⭕" label="show dlr ring — Anéis Device Level Ring"
+                              color={C.purple} accent="rgba(139,92,246,0.05)">
+                              <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                                {(() => {
+                                  const rings = [...new Set([
+                                    ...sw.dlrStatus.map(s => s.ring),
+                                    ...sw.dlrConfig.map(c => c.ring),
+                                  ])].sort((a, b) => a - b)
+                                  return rings.map(ring => {
+                                    const st  = sw.dlrStatus.find(s => s.ring === ring)
+                                    const cfg = sw.dlrConfig.find(c => c.ring === ring)
+                                    const ifs = sw.dlrInterfaces.filter(i => i.ring === ring).map(i => i.iface)
+                                    const ok  = st ? /normal/i.test(st.status) : true
+                                    const modeColor = st
+                                      ? (/active/i.test(st.mode) ? C.green : /backup/i.test(st.mode) ? C.orange : C.cyan)
+                                      : C.textD
+                                    return (
+                                      <div key={ring} style={{
+                                        border: `1px solid ${st && !ok ? C.red : C.border}`, borderRadius: 8,
+                                        background: st && !ok ? `${C.red}0A` : C.surface, overflow: 'hidden',
+                                      }}>
+                                        {/* header */}
+                                        <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 14px',
+                                          borderBottom: `1px solid ${C.border}`, flexWrap: 'wrap' }}>
+                                          <span style={{ fontSize: 14, fontWeight: 700, color: C.purple, fontFamily: C.mono }}>
+                                            ⭕ DLR Ring {ring}
+                                          </span>
+                                          {st && <Badge label={st.mode} color={modeColor} />}
+                                          {st && <Badge label={st.status} color={ok ? C.green : C.red} />}
+                                          {st && <Badge label={`Topologia: ${st.topology}`} color={C.blue} />}
+                                        </div>
+                                        {/* body grid */}
+                                        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 10, padding: 14 }}>
+                                          {[
+                                            { label: 'Mode (config)',   value: cfg ? cfg.mode : 'N/A',           color: C.text },
+                                            ...(st ? [
+                                              { label: 'Mode (runtime)',        value: st.mode,             color: modeColor },
+                                              { label: 'IOS State',             value: st.iosState,         color: C.textD },
+                                              { label: 'Hardware State',        value: st.hardwareState,    color: C.textD },
+                                              { label: 'Supervisor (deste SW)', value: `${st.supervisorMac} · ${st.supervisorIp}`, color: C.text },
+                                              { label: 'Supervisor Ativo',      value: `${st.activeSupervisorMac} · ${st.activeSupervisorIp}`, color: C.green },
+                                              { label: 'Beacon Int./Timeout',   value: `${st.beaconInterval} / ${st.beaconTimeout} µs`, color: C.textD },
+                                              { label: 'DLR VLAN ID',           value: st.dlrVlanId,        color: C.textD },
+                                              { label: 'Precedence (local)',    value: st.precedence,       color: C.cyan },
+                                              { label: 'Redundant Gateway',     value: st.redundantGateway, color: C.textD },
+                                              { label: 'Participantes',         value: st.participants !== null ? String(st.participants) : '—', color: C.cyan },
+                                              { label: 'Ring Faults',           value: st.ringFaults !== null ? String(st.ringFaults) : '—', color: st.ringFaults ? C.orange : C.textD },
+                                              { label: 'Última Falha',          value: st.lastFaultTime,    color: st.lastFaultTime !== 'N/A' ? C.orange : C.textD },
+                                            ] : []),
+                                          ].map(item => (
+                                            <div key={item.label} style={{ padding: '8px 12px', background: C.panel,
+                                              border: `1px solid ${C.border}`, borderRadius: 6 }}>
+                                              <p style={{ fontSize: 8, fontFamily: C.mono, textTransform: 'uppercase',
+                                                letterSpacing: '0.12em', color: C.textG, margin: '0 0 5px' }}>{item.label}</p>
+                                              <p style={{ fontSize: 11, fontWeight: 700, margin: 0, color: item.color, fontFamily: C.mono, wordBreak: 'break-all' }}>
+                                                {item.value}
+                                              </p>
+                                            </div>
+                                          ))}
+                                        </div>
+                                        {/* portas do anel (Port1/Port2 com vlan + estado) */}
+                                        {st && (st.port1 || st.port2) && (
+                                          <div style={{ padding: '0 14px 12px', display: 'flex', gap: 18, flexWrap: 'wrap' }}>
+                                            {[st.port1, st.port2].map((p, idx) => p && (
+                                              <div key={idx} style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+                                                <span style={{ fontSize: 8, fontFamily: C.mono, textTransform: 'uppercase', letterSpacing: '0.12em', color: C.textG }}>Port{idx + 1}</span>
+                                                <span style={{ padding: '2px 9px', borderRadius: 4, fontSize: 10, fontWeight: 700, fontFamily: C.mono, color: C.purple, background: `${C.purple}15`, border: `1px solid ${C.purple}40` }}>{p.name}</span>
+                                                <span style={{ fontSize: 9, fontFamily: C.mono, color: C.textD }}>vlan {p.vlan}</span>
+                                                <Badge label={p.state} color={/up/i.test(p.state) ? C.green : C.red} />
+                                              </div>
+                                            ))}
+                                          </div>
+                                        )}
+                                        {/* interfaces do anel (running-config) */}
+                                        {ifs.length > 0 && (
+                                          <div style={{ padding: '0 14px 12px', display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                                            <span style={{ fontSize: 8, fontFamily: C.mono, textTransform: 'uppercase',
+                                              letterSpacing: '0.12em', color: C.textG }}>Interfaces (config):</span>
+                                            {ifs.map(p => (
+                                              <span key={p} style={{ padding: '2px 9px', borderRadius: 4, fontSize: 10, fontWeight: 700,
+                                                fontFamily: C.mono, color: C.purple, background: `${C.purple}15`, border: `1px solid ${C.purple}40` }}>{p}</span>
+                                            ))}
+                                          </div>
+                                        )}
+                                        {/* localização de falhas (últimos nós ativos) */}
+                                        {st && st.faultLocations.length > 0 && (
+                                          <div style={{ padding: '0 14px 12px' }}>
+                                            <p style={{ fontSize: 8, fontFamily: C.mono, textTransform: 'uppercase', letterSpacing: '0.12em', color: C.textG, margin: '0 0 6px' }}>
+                                              Localização da última falha
+                                            </p>
+                                            <div style={{ border: `1px solid ${C.border}`, borderRadius: 6, overflow: 'hidden' }}>
+                                              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 9, fontFamily: C.mono }}>
+                                                <tbody>
+                                                  {st.faultLocations.map((fl, k) => (
+                                                    <tr key={k} style={{ borderBottom: `1px solid ${C.border}`, background: k % 2 ? C.surface : 'transparent' }}>
+                                                      <td style={{ padding: '5px 10px', color: C.orange }}>{fl.label}</td>
+                                                      <td style={{ padding: '5px 10px', color: C.text }}>{fl.mac}</td>
+                                                      <td style={{ padding: '5px 10px', color: C.cyan }}>{fl.ip}</td>
+                                                    </tr>
+                                                  ))}
+                                                </tbody>
+                                              </table>
+                                            </div>
+                                          </div>
+                                        )}
+                                        {/* participantes do anel (tabela completa) */}
+                                        {st && st.participantList.length > 0 && (
+                                          <div style={{ padding: '0 14px 12px' }}>
+                                            <p style={{ fontSize: 8, fontFamily: C.mono, textTransform: 'uppercase', letterSpacing: '0.12em', color: C.textG, margin: '0 0 6px' }}>
+                                              Participantes do anel ({st.participantList.length})
+                                            </p>
+                                            <div style={{ border: `1px solid ${C.border}`, borderRadius: 6, overflow: 'hidden', maxHeight: 240, overflowY: 'auto' }} className="nw-scroll">
+                                              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 9, fontFamily: C.mono }}>
+                                                <thead>
+                                                  <tr style={{ background: C.surface, borderBottom: `1px solid ${C.border}`, position: 'sticky', top: 0 }}>
+                                                    {['Nº', 'MAC-Addr', 'IP-Addr'].map(h => (
+                                                      <th key={h} style={{ padding: '6px 10px', textAlign: 'left', fontSize: 8, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.12em', color: C.textG }}>{h}</th>
+                                                    ))}
+                                                  </tr>
+                                                </thead>
+                                                <tbody>
+                                                  {st.participantList.map((p, k) => (
+                                                    <tr key={k} style={{ borderBottom: `1px solid ${C.border}`, background: k % 2 ? C.surface : 'transparent' }}>
+                                                      <td style={{ padding: '5px 10px', color: C.purple, fontWeight: 700 }}>{p.no}</td>
+                                                      <td style={{ padding: '5px 10px', color: C.text }}>{p.mac}</td>
+                                                      <td style={{ padding: '5px 10px', color: C.cyan }}>{p.ip}</td>
+                                                    </tr>
+                                                  ))}
+                                                </tbody>
+                                              </table>
+                                            </div>
+                                          </div>
+                                        )}
+                                      </div>
+                                    )
+                                  })
+                                })()}
+                              </div>
+                            </Panel>
+                          ) : (
+                            <div style={{ padding: 14, fontSize: 11, color: C.textG,
+                              border: `1px dashed ${C.border}`, borderRadius: 8 }}>
+                              Nenhum anel DLR configurado neste switch (sem seção "show dlr ring" nem "dlr ring" no running-config).
+                            </div>
+                          )}
                         </div>
                       )}
 

@@ -123,7 +123,7 @@ function resolvePython(): { cmd: string; args: string[] } {
     'Instale Python 3.11+ em https://www.python.org/downloads/\n' +
     'Durante a instalação, marque "Add Python to PATH" e\n' +
     '"Disable path length limit".\n\n' +
-    'Depois reinicie o Netwatch Topology.'
+    'Depois reinicie o Netwatch Analyzer.'
   )
 }
 
