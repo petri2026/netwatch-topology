@@ -20,6 +20,19 @@ interface InterfaceStatusEntry {
   port: string; name: string; status: string
   vlan: string; duplex: string; speed: string; type: string
 }
+// ── Transceiver DOM (show interface transceiver detail) ────────────────────
+interface TxMetric {                        // one measured value + its 4 thresholds
+  value: number
+  highAlarm: number; highWarn: number; lowWarn: number; lowAlarm: number
+}
+interface TransceiverEntry {                // one optical (SFP) port
+  port: string
+  temperature: TxMetric | null              // °C
+  voltage: TxMetric | null                  // V
+  current: TxMetric | null                  // mA (bias)
+  txPower: TxMetric | null                  // dBm (optical transmit)
+  rxPower: TxMetric | null                  // dBm (optical receive)
+}
 // ── DLR (Device Level Ring) — EtherNet/IP ring on Stratix switches ─────────
 interface DlrRingConfig {       // from show running-config
   ring: number; mode: string    // e.g. { ring: 1, mode: 'supervisor' }
@@ -171,6 +184,8 @@ interface SwitchData {
   catalystEnv: CatalystEnvData | null
   // show interfaces status
   interfaceStatus: InterfaceStatusEntry[]
+  // show interface transceiver detail (optical DOM)
+  transceivers: TransceiverEntry[]
   // DLR (Device Level Ring)
   dlrConfig: DlrRingConfig[]        // global rings + configured mode
   dlrInterfaces: DlrInterface[]     // interface ↔ ring
@@ -507,6 +522,27 @@ function computeHealthScore(sw: SwitchData, swLogs: LogEntry[]): HealthResult {
   if (sw.stpTopo.length > 0) {
     factors.push({ label: 'STP Topology Changes', ok: stpChanges < 5, detail: `${stpChanges} mudança(s)` })
     if (stpChanges >= 5) deductions += Math.min(stpChanges * 2, 15)
+  }
+
+  // 9. Transceptores Ópticos (DOM) — SFP com métrica fora do limiar é um indicador precoce
+  // de falha de enlace óptico (degradação de fibra, potência Rx baixa, temperatura alta).
+  if (sw.transceivers.length > 0) {
+    const txKeys: (keyof TransceiverEntry)[] = ['temperature', 'voltage', 'current', 'txPower', 'rxPower']
+    let txAlarm = 0, txWarn = 0
+    const alarmPorts = new Set<string>()
+    sw.transceivers.forEach(tx => {
+      txKeys.forEach(k => {
+        const st = txStatus(tx[k] as TxMetric | null)
+        if (st === 'alarm') { txAlarm++; alarmPorts.add(tx.port) }
+        else if (st === 'warn') txWarn++
+      })
+    })
+    const txDetail = txAlarm === 0 && txWarn === 0
+      ? `${sw.transceivers.length} porta(s) — todos dentro do limiar`
+      : `${txAlarm} alarme(s)${txWarn ? `, ${txWarn} atenção` : ''}${alarmPorts.size ? ` — ${[...alarmPorts].join(', ')}` : ''}`
+    factors.push({ label: 'Transceptores Ópticos (DOM)', ok: txAlarm === 0, detail: txDetail })
+    deductions += Math.min(txAlarm * 12, 30)
+    deductions += Math.min(txWarn * 4, 12)
   }
 
   const score = Math.max(0, 100 - deductions)
@@ -1477,45 +1513,150 @@ function parseEnv(text: string): EnvInfo | null {
   }
 }
 
-// Parse "show interfaces status" — fixed-width columns, so we align by the header's
-// column offsets (the Name column can contain spaces and even a '|', which breaks a
-// naive whitespace split).
+// Parse "show interfaces status".
+//
+// The status table can arrive with three different line-break behaviours depending on how
+// the capture was saved:
+//   • .txt (MobaXterm plain)  — one physical line per port (the classic layout).
+//   • Word-exported .rtf      — the whole table collapsed onto a single \par line, AND the
+//                               terminal wrap injects newlines mid-row (~col 95).
+//   • MobaXterm .rtf          — one line per port but a blank line between every row.
+// A line-by-line parser only handles the first case. So instead of relying on physical
+// lines, we collapse the section body's newlines to spaces and extract each row with a
+// global regex anchored on the Status token — this is layout-independent and unifies all
+// three formats.
+//
+// Interface abbreviations / full names that can start a valid status row.
+const _IFACE_NAMES =
+  'GigabitEthernet|TenGigabitEthernet|FastEthernet|FortyGigabitEthernet|HundredGigE|' +
+  'AppGigabitEthernet|TwentyFiveGigE|Port-channel|Gig|Ten|Twe|Two|Gi|Fa|Te|Tw|Fo|Hu|Ap|Po|Vl|Lo|Tu|Mg|Se|Fi|Eth'
+// Valid values of the Status column in "show interfaces status".
+const _IFACE_STATUS = 'connected|notconnect|notconnected|disabled|err-disabled|errdisabled|monitoring|sfpAbsent|faulty|inactive|noOperMem|dormant'
+
+// Logical (non-physical) interfaces that can appear in "show interfaces status" but should
+// be hidden from the physical port view: Port-channel, VLAN/SVI, Loopback, Tunnel and the
+// internal AppGigabitEthernet. Everything else (Gi/Fa/Te/Tw/Fo/Hu/Fi/Eth/Mgmt…) is physical.
+function isPhysicalIface(port: string): boolean {
+  return !/^(?:Po(?:rt-channel)?|Vl(?:an)?|Lo(?:opback)?|Tu(?:nnel)?|Ap(?:pGigabitEthernet)?)\d/i.test(port.trim())
+}
+
 function parseInterfaceStatus(text: string): InterfaceStatusEntry[] {
   const section = sectionBody(text, /---+\s*show interfaces status\s*---+/i)
   if (!section) return []
-  const lines = section.split('\n')
-  const hdrIdx = lines.findIndex(l =>
-    /^\s*Port\s+Name\s+Status\s+Vlan\s+Duplex\s+Speed\s+Type/i.test(l))
-  if (hdrIdx < 0) return []
-  const hdr = lines[hdrIdx]
-  // Only Port and Name need fixed-column slicing (Name may contain spaces / a '|').
-  // Status, Vlan, Duplex and Speed are single tokens and Type is the remainder — so the
-  // tail is whitespace-split, which stays aligned even when a value is wider than its
-  // header (e.g. "a-full a-1000").
-  const nameAt   = hdr.search(/\bName\b/)
-  const statusAt = hdr.search(/\bStatus\b/)
+  const hdrM = section.match(/\bPort\s+Name\s+Status\s+Vlan\s+Duplex\s+Speed\s+Type\b/i)
+  if (!hdrM) return []
+  // Body = everything after the header, bounded by the next "--- show ---" section.
+  let body = section.slice(hdrM.index! + hdrM[0].length)
+  const nx = body.search(/---+\s*show\s+/i)
+  if (nx >= 0) body = body.slice(0, nx)
+  // Collapse every (terminal-wrapped / blank-separated / single-line) row into one flat,
+  // uniformly space-separated string so the row regex is immune to the RTF/txt layout.
+  body = ' ' + body.replace(/\s*\n\s*/g, ' ').replace(/[ \t]{2,}/g, '  ').trim() + ' '
+
+  // Each row: <port> <name?> <status> <vlan> <duplex> <speed> <type?>, where Name may be
+  // empty or contain spaces / a '|'. The lookahead stops Type at the next port or the end.
+  const rowRe = new RegExp(
+    `(?:^|\\s)((?:${_IFACE_NAMES})\\d[\\d/.]*)\\s+(.*?)\\s*\\b(${_IFACE_STATUS})\\b` +
+    `\\s+(\\S+)\\s+(\\S+)\\s+(\\S+)(?:\\s+(.+?))?(?=\\s+(?:${_IFACE_NAMES})\\d[\\d/.]*\\s|\\s*$)`,
+    'gi')
 
   const results: InterfaceStatusEntry[] = []
-  for (let i = hdrIdx + 1; i < lines.length; i++) {
-    const line = lines[i]
-    if (/---+\s*show\s+/i.test(line)) break
-    if (!line.trim()) continue
-    const port = line.slice(0, nameAt).trim()
-    // A valid data row starts with an interface token (letters followed by a digit/slash).
-    if (!/^[A-Za-z]{2,4}[\d/]/.test(port)) continue
-    const name = line.slice(nameAt, statusAt).trim()
-    const rest = line.slice(statusAt).trim().split(/\s+/)
+  let m: RegExpExecArray | null
+  while ((m = rowRe.exec(body)) !== null) {
     results.push({
-      port,
-      name,
-      status: rest[0] ?? '',
-      vlan:   rest[1] ?? '',
-      duplex: rest[2] ?? '',
-      speed:  rest[3] ?? '',
-      type:   rest.slice(4).join(' '),
+      port:   m[1],
+      name:   (m[2] ?? '').trim(),
+      status: m[3],
+      vlan:   m[4],
+      duplex: m[5],
+      speed:  m[6],
+      type:   (m[7] ?? '').trim(),
     })
+    if (m.index === rowRe.lastIndex) rowRe.lastIndex++
   }
-  return results
+  // Only physical ports are shown — drop logical interfaces (Port-channel, VLAN, Loopback…).
+  return results.filter(r => isPhysicalIface(r.port))
+}
+
+// Threshold status for a transceiver metric: 'alarm' (>= high-alarm or <= low-alarm),
+// 'warn' (>= high-warn or <= low-warn), else 'ok'.
+function txStatus(m: TxMetric | null): 'alarm' | 'warn' | 'ok' | null {
+  if (!m) return null
+  if (m.value >= m.highAlarm || m.value <= m.lowAlarm) return 'alarm'
+  if (m.value >= m.highWarn  || m.value <= m.lowWarn)  return 'warn'
+  return 'ok'
+}
+
+// Short labels for each optical DOM metric, used by the "SFP em alarme" indicators.
+const _TX_METRIC_LABELS: { key: keyof TransceiverEntry; short: string; unit: string }[] = [
+  { key: 'temperature', short: 'Temp',  unit: '°C'  },
+  { key: 'voltage',     short: 'Vcc',   unit: 'V'   },
+  { key: 'current',     short: 'Ibias', unit: 'mA'  },
+  { key: 'txPower',     short: 'Tx',    unit: 'dBm' },
+  { key: 'rxPower',     short: 'Rx',    unit: 'dBm' },
+]
+
+// Transceiver (SFP DOM) metrics that crossed a threshold, as short human labels
+// (e.g. "Gi1/2 Rx -30.1dBm"). Drives the "SFP em alarme" alert/KPI on Analytics.
+function sfpAlarms(sw: SwitchData): { alarms: string[]; warns: string[] } {
+  const alarms: string[] = []
+  const warns:  string[] = []
+  sw.transceivers.forEach(tx => {
+    _TX_METRIC_LABELS.forEach(({ key, short, unit }) => {
+      const v = tx[key] as TxMetric | null
+      const st = txStatus(v)
+      if (st === 'alarm')     alarms.push(`${tx.port} ${short} ${v!.value}${unit}`)
+      else if (st === 'warn') warns.push(`${tx.port} ${short} ${v!.value}${unit}`)
+    })
+  })
+  return { alarms, warns }
+}
+
+// Parse "show interface transceiver detail" — five DOM sub-tables (Temperature, Voltage,
+// Current, Optical Transmit Power, Optical Receive Power) per optical port, each with the
+// measured value plus High/Low Alarm and Warn thresholds. Works with proper show-tech
+// section headers and manual terminal captures (which lack "--- show ---" delimiters).
+function parseTransceivers(text: string): TransceiverEntry[] {
+  const cmdM = text.match(/^.*show interfaces?\s+trans(?:ceiver)?\s+detail.*$/im)
+  let region: string
+  if (cmdM && cmdM.index !== undefined) {
+    const after = text.slice(cmdM.index + cmdM[0].length)
+    const end = after.search(/\n\S+[#>]\s*\w|\n---+\s*show/i)   // next command prompt / section
+    region = end > 0 ? after.slice(0, end) : after.slice(0, 6000)
+  } else {
+    const m = text.search(/^\s*(?:Temperature|Voltage|Optical)\b.*Threshold/im)
+    if (m < 0) return []
+    region = text.slice(m, m + 4000)
+  }
+
+  const metricRe: [RegExp, keyof TransceiverEntry][] = [
+    [/^\s+Temperature\s+Threshold/i, 'temperature'],
+    [/^\s+Voltage\s+Threshold/i,     'voltage'],
+    [/Current\s+Threshold/i,         'current'],
+    [/Transmit Power\s+Threshold/i,  'txPower'],
+    [/Receive Power\s+Threshold/i,   'rxPower'],
+  ]
+  const byPort = new Map<string, TransceiverEntry>()
+  const get = (p: string): TransceiverEntry => {
+    let e = byPort.get(p)
+    if (!e) { e = { port: p, temperature: null, voltage: null, current: null, txPower: null, rxPower: null }; byPort.set(p, e) }
+    return e
+  }
+  let metric: keyof TransceiverEntry | null = null
+  for (const line of region.split('\n')) {
+    const hit = metricRe.find(([re]) => re.test(line))
+    if (hit) { metric = hit[1]; continue }
+    if (!metric || metric === 'port') continue
+    const toks = line.trim().split(/\s+/)
+    if (!/^[A-Za-z][\w/.-]*\d/.test(toks[0] ?? '')) continue
+    // Skip the Lane column (N/A or int) and any alarm markers; keep the numeric columns:
+    // value + highAlarm + highWarn + lowWarn + lowAlarm (first 5 numbers).
+    const nums = toks.slice(1).filter(t => /^-?\d+\.?\d*$/.test(t)).map(Number)
+    if (nums.length < 5) continue
+    const [value, highAlarm, highWarn, lowWarn, lowAlarm] = nums
+    ;(get(toks[0]!) as any)[metric] = { value, highAlarm, highWarn, lowWarn, lowAlarm }
+  }
+  return [...byPort.values()]
 }
 
 // Status → colour mapping requested for the interfaces sub-tab.
@@ -1947,6 +2088,7 @@ function parseCisco(raw: string, filename: string): SwitchData {
     macPerVlan:        parseMacPerVlan(text),
     catalystEnv:       parseCatalystEnv(text),
     interfaceStatus:   parseInterfaceStatus(text),
+    transceivers:      parseTransceivers(text),
     ...(() => { const d = parseDlr(text); return { dlrConfig: d.config, dlrInterfaces: d.interfaces } })(),
     dlrStatus:         parseDlrRing(text),
   }
@@ -2085,6 +2227,7 @@ function parseModicon(raw: string, filename: string): SwitchData {
     env:               null,
     catalystEnv:       null,
     interfaceStatus:   [],
+    transceivers:      [],
     dlrConfig:         [],
     dlrInterfaces:     [],
     dlrStatus:         [],
@@ -2597,7 +2740,11 @@ function AnalyticsPanel({ switches }: { switches: SwitchData[] }) {
       sw.catalystEnv.fans.filter(f => !/^(ok|good)$/i.test(f.status)).forEach(f => alerts.push(`FAN ${f.name} falha`))
       sw.catalystEnv.powerSupplies.filter(ps => !/^(ok|good)$/i.test(ps.status)).forEach(ps => alerts.push(`PS ${ps.slot} falha`))
     }
-    return { sw, cpuMaxHour, cpuAvgHour, critHours, alerts }
+    // SFP óptico (DOM) fora do limiar — indicador precoce de falha de enlace.
+    const { alarms: sfpAl, warns: sfpWn } = sfpAlarms(sw)
+    if (sfpAl.length) alerts.push(`SFP em alarme: ${sfpAl.join(', ')}`)
+    if (sfpWn.length) alerts.push(`SFP em atenção: ${sfpWn.join(', ')}`)
+    return { sw, cpuMaxHour, cpuAvgHour, critHours, alerts, sfpAlarmCount: sfpAl.length }
   })
 
   // DLR columns only appear when at least one switch in the fleet uses DLR.
@@ -2616,6 +2763,7 @@ function AnalyticsPanel({ switches }: { switches: SwitchData[] }) {
   const critSwitches = rows.filter((r) => r.alerts.length > 0).length
 
   const tempAlertCount = switches.filter(s => s.tempAlert && (s.tempAlert.status === 'HIGH' || s.tempAlert.status === 'LOW')).length
+  const sfpAlarmSwitches = rows.filter(r => r.sfpAlarmCount > 0).length
 
   // Hotspot temperature: pick highest hotspot among all switches with Catalyst env
   const hotspotData = switches
@@ -2645,6 +2793,7 @@ function AnalyticsPanel({ switches }: { switches: SwitchData[] }) {
       color: hotspotColor,
     },
     { icon: '🌡️',  label: 'Temp. Alertas', value: String(tempAlertCount),                                     color: tempAlertCount > 0 ? C.red : C.green },
+    { icon: '📡',  label: 'SFP Alarme',    value: String(sfpAlarmSwitches),                                   color: sfpAlarmSwitches > 0 ? C.red : C.green },
     { icon: '🚨',  label: 'Total Alertas', value: String(totalAlerts),                                        color: totalAlerts > 0 ? C.orange : C.green },
   ]
 
@@ -2661,7 +2810,7 @@ function AnalyticsPanel({ switches }: { switches: SwitchData[] }) {
     <div style={{ flex: 1, overflowY: 'auto', padding: 20, display: 'flex', flexDirection: 'column', gap: 20 }}>
 
       {/* KPI cards */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(7, minmax(120px, 1fr))', gap: 12, flexWrap: 'wrap' }}>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(8, minmax(120px, 1fr))', gap: 12, flexWrap: 'wrap' }}>
         {kpis.map((k) => (
           <div key={k.label} style={{
             padding: '14px 16px', background: C.panel,
@@ -2859,7 +3008,8 @@ function AnalyticsPanel({ switches }: { switches: SwitchData[] }) {
                       {alerts.length === 0
                         ? <Badge label="OK" color={C.green} />
                         : <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
-                            {alerts.map((a) => <Badge key={a} label={a} color={C.red} />)}
+                            {/* Warn-level alerts (SFP em atenção) in orange; alarms/faults in red. */}
+                            {alerts.map((a) => <Badge key={a} label={a} color={a.startsWith('SFP em atenção') ? C.orange : C.red} />)}
                           </div>
                       }
                     </td>
@@ -2907,6 +3057,12 @@ function xlSectionRow(label: string, colspan = 3): string {
 // Text status cells (Status column)
 function xlWarnCell(value: string, isWarn: boolean): string {
   return `<Cell ss:StyleID="${isWarn ? 'txtWarn' : 'txtOk'}"><Data ss:Type="String">${value}</Data></Cell>`
+}
+// Alert cell with three severity levels: ok (green) / attention (orange) / alarm (red).
+function xlAlertCell(value: string, level: 'ok' | 'attn' | 'alarm'): string {
+  const sid = level === 'alarm' ? 'txtWarn' : level === 'attn' ? 'txtAttn' : 'txtOk'
+  const safe = String(value).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+  return `<Cell ss:StyleID="${sid}"><Data ss:Type="String">${safe}</Data></Cell>`
 }
 
 function buildWorksheet(sw: SwitchData, sheetName?: string): string {
@@ -3245,6 +3401,39 @@ function buildWorksheet(sw: SwitchData, sheetName?: string): string {
     rows.push(`<Row ss:AutoFitHeight="1"/>`)
   }
 
+  // ── Transceiver Detail (DOM óptico) ───────────────────────────────────────
+  if (sw.transceivers.length > 0) {
+    rows.push(xlSectionRow('Transceiver Detail — show interface transceiver detail', 8))
+    rows.push(xlRow(
+      xlHeader('Porta'), xlHeader('Métrica'), xlHeader('Valor'),
+      xlHeader('High Alarm'), xlHeader('High Warn'), xlHeader('Low Warn'), xlHeader('Low Alarm'),
+      xlHeader('Status'),
+    ))
+    const txMetrics: { key: keyof TransceiverEntry; label: string }[] = [
+      { key: 'temperature', label: 'Temperatura (°C)' },
+      { key: 'voltage',     label: 'Voltagem (V)' },
+      { key: 'current',     label: 'Corrente (mA)' },
+      { key: 'txPower',     label: 'Potência Tx (dBm)' },
+      { key: 'rxPower',     label: 'Potência Rx (dBm)' },
+    ]
+    sw.transceivers.forEach(tx => {
+      txMetrics.forEach(m => {
+        const v = tx[m.key] as TxMetric | null
+        if (!v) return
+        const st = txStatus(v)
+        const warn = st === 'alarm' || st === 'warn'
+        rows.push(xlRow(
+          xlCell(tx.port), xlCell(m.label),
+          xlWarnCell(String(v.value), warn),
+          xlCell(String(v.highAlarm)), xlCell(String(v.highWarn)),
+          xlCell(String(v.lowWarn)), xlCell(String(v.lowAlarm)),
+          xlWarnCell(st === 'alarm' ? 'ALARME' : st === 'warn' ? 'ATENÇÃO' : 'OK', warn),
+        ))
+      })
+    })
+    rows.push(`<Row ss:AutoFitHeight="1"/>`)
+  }
+
   // ── show running-config (dados brutos) ───────────────────────────────────
   const rawRunCfg: string = (sw as any)._rawRunningConfig ?? ''
   if (rawRunCfg) {
@@ -3310,6 +3499,9 @@ function buildAnalyticsWorksheet(switches: SwitchData[]): string {
         if (!/^(ok|good)$/i.test(ps.status)) alerts.push(`PS ${ps.slot} FALHA`)
       })
     }
+    const { alarms: sfpAl, warns: sfpWn } = sfpAlarms(sw)
+    if (sfpAl.length) alerts.push(`SFP em alarme: ${sfpAl.join(', ')}`)
+    if (sfpWn.length) alerts.push(`SFP em atenção: ${sfpWn.join(', ')}`)
     const swLogs: LogEntry[] = ((sw as any)._logEntries ?? []) as LogEntry[]
     if (swLogs.some(e => e.severity <= 3)) alerts.push(`${swLogs.filter(e => e.severity <= 3).length} log(s) crítico(s)`)
 
@@ -3363,7 +3555,13 @@ function buildAnalyticsWorksheet(switches: SwitchData[]): string {
           : xlCell('—'),
       xlWarnCell(lA, cA === C.red),
       xlWarnCell(lB, cB === C.red),
-      xlWarnCell(alerts.length > 0 ? alerts.join(' | ') : 'OK', alerts.length > 0),
+      // Alertas: laranja quando os únicos alertas são "SFP em atenção" (warn); vermelho
+      // quando há qualquer alerta de alarme/falha; verde quando não há alertas.
+      (() => {
+        const hardAlerts = alerts.filter(a => !a.startsWith('SFP em atenção'))
+        const level = alerts.length === 0 ? 'ok' : hardAlerts.length > 0 ? 'alarm' : 'attn'
+        return xlAlertCell(alerts.length > 0 ? alerts.join(' | ') : 'OK', level)
+      })(),
     ))
   })
   return `<Worksheet ss:Name="Analytics">
@@ -3371,16 +3569,29 @@ function buildAnalyticsWorksheet(switches: SwitchData[]): string {
   </Worksheet>`
 }
 
-// Extract the interface/port referenced in a log message, e.g.
-//   "Interface GigabitEthernet1/8, changed state to up" → "GigabitEthernet1/8"
-//   "Clear counter on interface Gi1/2"                  → "Gi1/2"
-//   "Line protocol on Interface Vlan114, ..."           → "Vlan114"
-// Returns '' when the message references no interface (NTP, CONFIG_I, etc.).
-// The token stops at the valid end of an interface name (Type+slot/port) so a terminal
-// wrap that merged a following word (e.g. "...Gi1/2by console") still yields "Gi1/2".
+// Extract the interface/port referenced in a log message and normalize it to the canonical
+// short form, so the timeline interface filter groups every spelling of a port together:
+//   "Interface GigabitEthernet1/8, changed state to up"        → "Gi1/8"
+//   "Clear counter on interface Gi1/2"                         → "Gi1/2"
+//   "MACFLAP_NOTIF: ... flapping between port Te1/1/2 and ..." → "Te1/1/2"  (first port)
+//   "Line protocol on Interface Vlan114, ..."                 → "Vlan114"
+// The match anchors on "interface" OR "port" (MACFLAP/SPANTREE messages use "port <if>"
+// with the abbreviated name), which the previous version ignored. shortenIface() then
+// unifies GigabitEthernet1/2 and Gi1/2 into one filter value. Returns '' when the message
+// references no interface (NTP, CONFIG_I, etc.). The token stops at the valid end of an
+// interface name so a terminal wrap that merged a following word still yields the port.
 function logIface(msg: string): string {
-  const m = msg.match(/\binterface\s+([A-Za-z][A-Za-z-]*\d[\d/]*)/i)
-  return m ? m[1] : ''
+  // 1) Interface referenced after "interface"/"port"/"on"
+  //    (LINK/LINEPROTO/MACFLAP/SPANTREE/err-disable messages).
+  let m = msg.match(/\b(?:interface|port|on)\s+([A-Za-z][A-Za-z-]*\d[\d/]*)/i)
+  // 2) Optical DOM threshold syslogs lead with the port + colon and carry no anchor word
+  //    (e.g. "Gi1/1: Rx power low warning; ..."). Match a known interface type at the start.
+  if (!m) m = msg.match(new RegExp(`^\\s*((?:${_IFACE_NAMES})\\d[\\d/]*)\\b`, 'i'))
+  if (!m) return ''
+  // The "on" anchor also matches login lines ("Login Success ... on vty0"); those virtual
+  // terminal lines are not physical interfaces, so drop them from the interface filter.
+  if (/^(?:vty|tty|con|aux|line)\d/i.test(m[1])) return ''
+  return shortenIface(m[1])
 }
 
 // ── Timeline worksheet — todos os logs de todos os switches cronologicamente
@@ -4113,6 +4324,39 @@ function exportToWord(switches: SwitchData[], netIntel: NetIntel) {
         </table>`)
       }
 
+      // Transceiver Detail (DOM óptico) — espelha o Excel/software, logo após interfaces
+      if (sw.transceivers.length > 0) {
+        const txMetricsW: { key: keyof TransceiverEntry; label: string }[] = [
+          { key: 'temperature', label: 'Temperatura (°C)' },
+          { key: 'voltage',     label: 'Voltagem (V)' },
+          { key: 'current',     label: 'Corrente (mA)' },
+          { key: 'txPower',     label: 'Potência Tx (dBm)' },
+          { key: 'rxPower',     label: 'Potência Rx (dBm)' },
+        ]
+        const txRows: string[] = []
+        sw.transceivers.forEach(tx => {
+          const portAlarm = txMetricsW.some(m => txStatus(tx[m.key] as TxMetric | null) === 'alarm')
+          txMetricsW.forEach(m => {
+            const v = tx[m.key] as TxMetric | null
+            if (!v) return
+            const st = txStatus(v)
+            const cls = st === 'alarm' ? 'warn' : st === 'warn' ? 'warn' : 'ok'
+            const lbl = st === 'alarm' ? 'ALARME' : st === 'warn' ? 'ATENÇÃO' : 'OK'
+            txRows.push(`<tr${portAlarm ? ' style="background:#fff1f1"' : ''}>
+              <td><strong>${esc(tx.port)}</strong></td><td class="dim">${esc(m.label)}</td>
+              <td class="${st === 'ok' ? '' : 'warn'}">${esc(String(v.value))}</td>
+              <td class="dim">${esc(String(v.highAlarm))}</td><td class="dim">${esc(String(v.highWarn))}</td>
+              <td class="dim">${esc(String(v.lowWarn))}</td><td class="dim">${esc(String(v.lowAlarm))}</td>
+              <td class="${cls}">${lbl}</td></tr>`)
+          })
+        })
+        body.push(`<h4>Transceiver Detail — Diagnóstico Óptico (DOM)</h4>`)
+        body.push(`<table style="font-size:7.5pt">
+          <thead>${thRow('Porta', 'Métrica', 'Valor', 'High Alarm', 'High Warn', 'Low Warn', 'Low Alarm', 'Status')}</thead>
+          <tbody>${txRows.join('')}</tbody>
+        </table>`)
+      }
+
       // CPU chart
       body.push(`<h4>Histórico de CPU — 72h</h4>`)
       body.push(sw.cpuHour.length > 0 ? cpuChart(sw.cpuHour, 'horas') : `<p class="dim">Sem dados.</p>`)
@@ -4325,6 +4569,10 @@ function exportToExcel(switches: SwitchData[]) {
     </Style>
     <Style ss:ID="txtOk">
       <Font ss:Bold="1" ss:Color="#10B981" ss:FontName="Consolas"/>
+    </Style>
+    <Style ss:ID="txtAttn">
+      <Font ss:Bold="1" ss:Color="#F59E0B" ss:FontName="Consolas"/>
+      <Interior ss:Color="#2A1D00" ss:Pattern="Solid"/>
     </Style>
     <Style ss:ID="pctWarn">
       <Font ss:Bold="1" ss:Color="#EF4444" ss:FontName="Consolas"/>
@@ -4666,7 +4914,7 @@ function SecurityView({ netIntel }: { netIntel: NetIntel }) {
 }
 
 // ─── Main Component ───────────────────────────────────────────────────────
-type TabId     = 'cpu' | 'memory' | 'network' | 'env' | 'stp' | 'config' | 'dlr' | 'interfaces' | 'inventory'
+type TabId     = 'cpu' | 'memory' | 'network' | 'env' | 'stp' | 'config' | 'dlr' | 'interfaces' | 'transceiver' | 'inventory'
 type ViewMode  = 'detail' | 'analytics' | 'timeline' | 'security'
 
 const TABS: { id: TabId; icon: string; label: string }[] = [
@@ -4678,6 +4926,7 @@ const TABS: { id: TabId; icon: string; label: string }[] = [
   { id: 'config',    icon: '⚙️', label: 'Configuração' },
   { id: 'dlr',       icon: '⭕', label: 'DLR' },
   { id: 'interfaces', icon: '🔗', label: 'Interfaces' },
+  { id: 'transceiver', icon: '📡', label: 'Transceiver Detail' },
   { id: 'inventory', icon: '🔌', label: 'Inventário' },
 ]
 
@@ -6373,6 +6622,81 @@ export default function ShowtechView() {
                             <div style={{ padding: 14, fontSize: 11, color: C.textG,
                               border: `1px dashed ${C.border}`, borderRadius: 8 }}>
                               Seção "show interfaces status" não encontrada no arquivo.
+                            </div>
+                          )}
+                        </div>
+                      )}
+
+                      {/* ── TRANSCEIVER DETAIL (DOM) ─────────────────── */}
+                      {tab === 'transceiver' && (
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+                          {sw.transceivers.length > 0 ? (
+                            <Panel icon="📡" label="show interface transceiver detail — Diagnóstico Óptico (DOM)"
+                              color={C.cyan} accent="rgba(34,211,238,0.04)">
+                              {(() => {
+                                const metrics: { key: keyof TransceiverEntry; label: string; unit: string }[] = [
+                                  { key: 'temperature', label: 'Temperatura',     unit: '°C'  },
+                                  { key: 'voltage',     label: 'Voltagem',        unit: 'V'   },
+                                  { key: 'current',     label: 'Corrente (bias)', unit: 'mA'  },
+                                  { key: 'txPower',     label: 'Potência Tx',     unit: 'dBm' },
+                                  { key: 'rxPower',     label: 'Potência Rx',     unit: 'dBm' },
+                                ]
+                                const stColor = (s: string | null) => s === 'alarm' ? C.red : s === 'warn' ? C.orange : s === 'ok' ? C.green : C.textG
+                                return (
+                                  <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+                                    {sw.transceivers.map(tx => {
+                                      const worst = metrics.map(m => txStatus(tx[m.key] as TxMetric | null))
+                                        .reduce((a, s) => s === 'alarm' || a === 'alarm' ? 'alarm' : s === 'warn' || a === 'warn' ? 'warn' : (a ?? s), null as any)
+                                      return (
+                                        <div key={tx.port} style={{
+                                          border: `1px solid ${worst === 'alarm' ? C.red : worst === 'warn' ? C.orange : C.border}`,
+                                          borderRadius: 8, background: worst === 'alarm' ? `${C.red}0A` : C.surface, overflow: 'hidden',
+                                        }}>
+                                          <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '9px 14px', borderBottom: `1px solid ${C.border}` }}>
+                                            <span style={{ fontSize: 13, fontWeight: 700, color: C.cyan, fontFamily: C.mono }}>📡 {tx.port}</span>
+                                            {worst && <Badge label={worst === 'alarm' ? 'ALARME' : worst === 'warn' ? 'ATENÇÃO' : 'OK'} color={stColor(worst)} />}
+                                          </div>
+                                          <div style={{ overflowX: 'auto' }}>
+                                            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 10, fontFamily: C.mono, whiteSpace: 'nowrap' }}>
+                                              <thead>
+                                                <tr style={{ background: C.panel, borderBottom: `1px solid ${C.border}` }}>
+                                                  {['Métrica', 'Valor', 'High Alarm', 'High Warn', 'Low Warn', 'Low Alarm', 'Status'].map(h => (
+                                                    <th key={h} style={{ padding: '6px 12px', textAlign: 'left', fontSize: 8, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.12em', color: C.textG }}>{h}</th>
+                                                  ))}
+                                                </tr>
+                                              </thead>
+                                              <tbody>
+                                                {metrics.map((m, i) => {
+                                                  const v = tx[m.key] as TxMetric | null
+                                                  if (!v) return null
+                                                  const st = txStatus(v)
+                                                  return (
+                                                    <tr key={m.key} style={{ borderBottom: `1px solid ${C.border}`, background: i % 2 ? C.surface : 'transparent' }}>
+                                                      <td style={{ padding: '6px 12px', color: C.text }}>{m.label} <span style={{ color: C.textG }}>({m.unit})</span></td>
+                                                      <td style={{ padding: '6px 12px', fontWeight: 700, color: stColor(st) }}>{v.value}</td>
+                                                      <td style={{ padding: '6px 12px', color: C.textD }}>{v.highAlarm}</td>
+                                                      <td style={{ padding: '6px 12px', color: C.textD }}>{v.highWarn}</td>
+                                                      <td style={{ padding: '6px 12px', color: C.textD }}>{v.lowWarn}</td>
+                                                      <td style={{ padding: '6px 12px', color: C.textD }}>{v.lowAlarm}</td>
+                                                      <td style={{ padding: '6px 12px' }}>
+                                                        <Badge label={st === 'alarm' ? 'ALARME' : st === 'warn' ? 'ATENÇÃO' : 'OK'} color={stColor(st)} />
+                                                      </td>
+                                                    </tr>
+                                                  )
+                                                })}
+                                              </tbody>
+                                            </table>
+                                          </div>
+                                        </div>
+                                      )
+                                    })}
+                                  </div>
+                                )
+                              })()}
+                            </Panel>
+                          ) : (
+                            <div style={{ padding: 14, fontSize: 11, color: C.textG, border: `1px dashed ${C.border}`, borderRadius: 8 }}>
+                              Nenhum dado de transceiver óptico (DOM) encontrado — o switch não possui portas SFP com monitoramento ou o comando "show interface transceiver detail" não está no arquivo.
                             </div>
                           )}
                         </div>
