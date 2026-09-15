@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react'
+import { useState, useCallback, Fragment } from 'react'
 
 // ─── Types ────────────────────────────────────────────────────────────────
 interface CpuNow {
@@ -2700,6 +2700,260 @@ function HealthScoreCard({ sw, swLogs }: { sw: SwitchData; swLogs: LogEntry[] })
   )
 }
 
+// ─── Empty-state helper (shared by the global views) ──────────────────────
+function EmptyGlobal({ icon, text }: { icon: string; text: string }) {
+  return (
+    <div style={{
+      flex: 1, display: 'flex', flexDirection: 'column',
+      alignItems: 'center', justifyContent: 'center', gap: 12, padding: 40,
+    }}>
+      <span style={{ fontSize: 40 }}>{icon}</span>
+      <p style={{ fontSize: 12, color: C.textG, fontFamily: C.mono, textAlign: 'center', maxWidth: 460 }}>{text}</p>
+    </div>
+  )
+}
+
+// Header cell + body cell used by the global tables (mirrors the Analytics table styling).
+const GTh = ({ children }: { children: React.ReactNode }) => (
+  <th style={{
+    padding: '8px 12px', textAlign: 'left', fontSize: 8, fontWeight: 700,
+    textTransform: 'uppercase', letterSpacing: '0.15em', color: C.textG,
+    background: C.surface, borderBottom: `1px solid ${C.border}`, whiteSpace: 'nowrap',
+    position: 'sticky', top: 0, zIndex: 2,
+  }}>{children}</th>
+)
+const GTd = ({ children, warn = false, color, bold = false }: {
+  children: React.ReactNode; warn?: boolean; color?: string; bold?: boolean
+}) => (
+  <td style={{
+    padding: '7px 12px', whiteSpace: 'nowrap', fontFamily: C.mono, fontSize: 10,
+    color: warn ? C.red : color ?? C.text, fontWeight: warn || bold ? 700 : 400,
+    borderBottom: `1px solid ${C.border}`,
+  }}>{children}</td>
+)
+
+// ─── SFP Global View ──────────────────────────────────────────────────────
+function SfpGlobalView({ switches }: { switches: SwitchData[] }) {
+  const swWithSfp = switches.filter(sw => sw.sfpInventory.length > 0)
+  if (!switches.length)
+    return <EmptyGlobal icon="🔌" text="Carregue arquivos RTF para visualizar o inventário de módulos SFP." />
+  if (!swWithSfp.length)
+    return <EmptyGlobal icon="🔌" text="Nenhum módulo SFP identificado nos arquivos carregados." />
+
+  // Padronização de hardware — total + contagem por PID.
+  const pidCount = new Map<string, number>()
+  let total = 0
+  swWithSfp.forEach(sw => sw.sfpInventory.forEach(s => {
+    total++; const k = s.pid || '—'; pidCount.set(k, (pidCount.get(k) ?? 0) + 1)
+  }))
+  const pidRows = [...pidCount.entries()].sort((a, b) => b[1] - a[1])
+
+  return (
+    <div style={{ flex: 1, overflowY: 'auto', padding: 20, display: 'flex', flexDirection: 'column', gap: 20 }}>
+      <Panel icon="🔌" label="Inventário Global de Módulos SFP" color={C.cyan} accent="rgba(34,211,238,0.04)"
+        right={<span style={{ fontSize: 9, fontFamily: C.mono, color: C.textG }}>{total} módulo(s) · {swWithSfp.length} switch(es)</span>}>
+        <div style={{ overflowX: 'auto', overflowY: 'auto', maxHeight: 460, border: `1px solid ${C.border}`, borderRadius: 8 }}>
+          <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+            <thead><tr><GTh>Switch</GTh><GTh>Porta (NAME)</GTh><GTh>Descrição (DESCR)</GTh><GTh>Modelo (PID)</GTh><GTh>S/N</GTh></tr></thead>
+            <tbody>
+              {swWithSfp.flatMap((sw, si) => sw.sfpInventory.map((s, i) => (
+                <tr key={`${si}-${i}`} style={{ background: (si + i) % 2 === 0 ? 'transparent' : C.surface }}>
+                  <GTd bold color={C.text}>{sw.hostname}</GTd>
+                  <GTd color={C.cyan}>{s.port}</GTd>
+                  <GTd color={C.textD}>{s.descr || '—'}</GTd>
+                  <GTd color={C.textD}>{s.pid || '—'}</GTd>
+                  <GTd color={C.textD}>{s.sn || '—'}</GTd>
+                </tr>
+              )))}
+            </tbody>
+          </table>
+        </div>
+      </Panel>
+
+      <Panel icon="📦" label="Resumo de Padronização — Modelos (PID)" color={C.purple} accent="rgba(139,92,246,0.04)"
+        right={<span style={{ fontSize: 9, fontFamily: C.mono, color: C.textG }}>{pidCount.size} PID(s) distinto(s)</span>}>
+        <div style={{ overflowX: 'auto', border: `1px solid ${C.border}`, borderRadius: 8 }}>
+          <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+            <thead><tr><GTh>Modelo (PID)</GTh><GTh>Quantidade</GTh></tr></thead>
+            <tbody>
+              {pidRows.map(([pid, c], i) => (
+                <tr key={pid} style={{ background: i % 2 === 0 ? 'transparent' : C.surface }}>
+                  <GTd color={C.textD}>{pid}</GTd>
+                  <GTd bold color={C.cyan}>{c}</GTd>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </Panel>
+    </div>
+  )
+}
+
+// ─── IPs por VLAN View ────────────────────────────────────────────────────
+function IpVlanView({ switches }: { switches: SwitchData[] }) {
+  if (!switches.length)
+    return <EmptyGlobal icon="🌐" text="Carregue arquivos RTF para visualizar os endereços IP por VLAN." />
+
+  const all = switches.flatMap(sw => sw.vlans.map(v => ({
+    host: sw.hostname, vlan: v.vlan, ip: v.ip, mask: v.mask, gw: sw.gateway,
+  })))
+  if (!all.length)
+    return <EmptyGlobal icon="🌐" text="Nenhum endereço IP por VLAN (SVI) identificado nos arquivos carregados." />
+
+  const valid = (ip: string) => !!ip && ip.trim() !== '' && ip.trim() !== 'N/A' && ip.trim() !== '0.0.0.0' && ip.trim() !== '—'
+  const ipCount = new Map<string, number>()
+  all.forEach(r => { if (valid(r.ip)) ipCount.set(r.ip, (ipCount.get(r.ip) ?? 0) + 1) })
+  const conflicts = [...ipCount.entries()].filter(([, c]) => c > 1).sort((a, b) => b[1] - a[1])
+
+  // Agrupa por VLAN (ordenadas numericamente) — o usuário vê os IPs de cada VLAN juntos.
+  const byVlan = new Map<string, typeof all>()
+  all.forEach(r => { const a = byVlan.get(r.vlan) ?? []; a.push(r); byVlan.set(r.vlan, a) })
+  const vlanKeys = [...byVlan.keys()].sort((a, b) =>
+    ((parseInt(a, 10) || 0) - (parseInt(b, 10) || 0)) || a.localeCompare(b))
+
+  return (
+    <div style={{ flex: 1, overflowY: 'auto', padding: 20, display: 'flex', flexDirection: 'column', gap: 20 }}>
+      {conflicts.length > 0 && (
+        <div style={{
+          padding: '10px 16px', background: 'rgba(239,68,68,0.08)', border: `1px solid ${C.red}55`,
+          borderRadius: 8, fontSize: 10, fontFamily: C.mono, color: C.red,
+        }}>
+          ⚠ <strong>{conflicts.length} endereço(s) IP duplicado(s)</strong> entre switches: {conflicts.map(([ip, c]) => `${ip} (${c}×)`).join('  ·  ')}
+        </div>
+      )}
+      <Panel icon="🌐" label="Endereços IP por VLAN (SVI)" color={C.blue} accent="rgba(59,130,246,0.04)"
+        right={<span style={{ fontSize: 9, fontFamily: C.mono, color: C.textG }}>{vlanKeys.length} VLAN(s) · {all.length} interface(s) · {switches.length} switch(es)</span>}>
+        <div style={{ overflowX: 'auto', overflowY: 'auto', maxHeight: 560, border: `1px solid ${C.border}`, borderRadius: 8 }}>
+          <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+            <thead><tr><GTh>Switch</GTh><GTh>Endereço IP</GTh><GTh>Máscara</GTh><GTh>Gateway</GTh></tr></thead>
+            <tbody>
+              {vlanKeys.map(vk => {
+                const members = byVlan.get(vk)!
+                const grpDup = members.some(r => valid(r.ip) && (ipCount.get(r.ip) ?? 0) > 1)
+                return (
+                  <Fragment key={vk}>
+                    {/* Sub-cabeçalho da VLAN */}
+                    <tr>
+                      <td colSpan={4} style={{
+                        padding: '6px 12px', background: grpDup ? 'rgba(239,68,68,0.10)' : `${C.purple}14`,
+                        borderTop: `1px solid ${C.border}`, borderBottom: `1px solid ${C.border}`,
+                        fontFamily: C.mono, fontSize: 10, fontWeight: 700,
+                        color: grpDup ? C.red : C.purple, whiteSpace: 'nowrap',
+                      }}>
+                        🔖 VLAN {vk}
+                        <span style={{ color: C.textG, fontWeight: 400 }}>  —  {members.length} host(s)</span>
+                        {grpDup && <span style={{ color: C.red }}>  ⚠ IP duplicado</span>}
+                      </td>
+                    </tr>
+                    {members.map((r, i) => {
+                      const dup = valid(r.ip) && (ipCount.get(r.ip) ?? 0) > 1
+                      return (
+                        <tr key={`${vk}-${i}`} style={{ background: dup ? 'rgba(239,68,68,0.06)' : i % 2 === 0 ? 'transparent' : C.surface }}>
+                          <GTd bold color={C.text}>{r.host}</GTd>
+                          <GTd warn={dup} color={C.cyan}>{r.ip || '—'}{dup && ' ⚠'}</GTd>
+                          <GTd color={C.textD}>{r.mask || '—'}</GTd>
+                          <GTd color={C.textD}>{r.gw || '—'}</GTd>
+                        </tr>
+                      )
+                    })}
+                  </Fragment>
+                )
+              })}
+            </tbody>
+          </table>
+        </div>
+      </Panel>
+    </div>
+  )
+}
+
+// ─── Transceiver DOM (global) View ────────────────────────────────────────
+function TransceiverGlobalView({ switches }: { switches: SwitchData[] }) {
+  const swWithTx = switches.filter(sw => sw.transceivers.length > 0)
+  if (!switches.length)
+    return <EmptyGlobal icon="🔬" text="Carregue arquivos RTF para visualizar o diagnóstico óptico (DOM)." />
+  if (!swWithTx.length)
+    return <EmptyGlobal icon="🔬" text="Nenhum dado de transceiver óptico (DOM) encontrado nos arquivos carregados." />
+
+  const metrics: { key: keyof TransceiverEntry; label: string; unit: string }[] = [
+    { key: 'temperature', label: 'Temperatura',     unit: '°C'  },
+    { key: 'voltage',     label: 'Voltagem',        unit: 'V'   },
+    { key: 'current',     label: 'Corrente (bias)', unit: 'mA'  },
+    { key: 'txPower',     label: 'Potência Tx',     unit: 'dBm' },
+    { key: 'rxPower',     label: 'Potência Rx',     unit: 'dBm' },
+  ]
+  const stColor = (s: string | null) => s === 'alarm' ? C.red : s === 'warn' ? C.orange : s === 'ok' ? C.green : C.textG
+
+  return (
+    <div style={{ flex: 1, overflowY: 'auto', padding: 20, display: 'flex', flexDirection: 'column', gap: 20 }}>
+      {swWithTx.map(sw => {
+        const swAlarm = sw.transceivers.reduce((n, tx) => n + metrics.filter(m => txStatus(tx[m.key] as TxMetric | null) === 'alarm').length, 0)
+        const swWarn  = sw.transceivers.reduce((n, tx) => n + metrics.filter(m => txStatus(tx[m.key] as TxMetric | null) === 'warn').length, 0)
+        return (
+          <Panel key={sw.hostname} icon="🔬" label={`${sw.hostname} — Diagnóstico Óptico (DOM)`}
+            color={swAlarm > 0 ? C.red : swWarn > 0 ? C.orange : C.cyan}
+            accent={swAlarm > 0 ? 'rgba(239,68,68,0.05)' : 'rgba(34,211,238,0.04)'}
+            right={<span style={{ fontSize: 9, fontFamily: C.mono }}>
+              <span style={{ color: swAlarm > 0 ? C.red : C.textG }}>{swAlarm} alarme(s)</span>
+              <span style={{ color: C.textG }}> · </span>
+              <span style={{ color: swWarn > 0 ? C.orange : C.textG }}>{swWarn} atenção</span>
+            </span>}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+              {sw.transceivers.map(tx => {
+                const worst = metrics.map(m => txStatus(tx[m.key] as TxMetric | null))
+                  .reduce((a, s) => s === 'alarm' || a === 'alarm' ? 'alarm' : s === 'warn' || a === 'warn' ? 'warn' : (a ?? s), null as any)
+                return (
+                  <div key={tx.port} style={{
+                    border: `1px solid ${worst === 'alarm' ? C.red : worst === 'warn' ? C.orange : C.border}`,
+                    borderRadius: 8, background: worst === 'alarm' ? `${C.red}0A` : C.surface, overflow: 'hidden',
+                  }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '9px 14px', borderBottom: `1px solid ${C.border}` }}>
+                      <span style={{ fontSize: 13, fontWeight: 700, color: C.cyan, fontFamily: C.mono }}>📡 {tx.port}</span>
+                      {worst && <Badge label={worst === 'alarm' ? 'ALARME' : worst === 'warn' ? 'ATENÇÃO' : 'OK'} color={stColor(worst)} />}
+                    </div>
+                    <div style={{ overflowX: 'auto' }}>
+                      <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 10, fontFamily: C.mono, whiteSpace: 'nowrap' }}>
+                        <thead>
+                          <tr style={{ background: C.panel, borderBottom: `1px solid ${C.border}` }}>
+                            {['Métrica', 'Valor', 'High Alarm', 'High Warn', 'Low Warn', 'Low Alarm', 'Status'].map(h => (
+                              <th key={h} style={{ padding: '6px 12px', textAlign: 'left', fontSize: 8, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.12em', color: C.textG }}>{h}</th>
+                            ))}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {metrics.map((m, i) => {
+                            const v = tx[m.key] as TxMetric | null
+                            if (!v) return null
+                            const st = txStatus(v)
+                            return (
+                              <tr key={m.key} style={{ borderBottom: `1px solid ${C.border}`, background: i % 2 ? C.surface : 'transparent' }}>
+                                <td style={{ padding: '6px 12px', color: C.text }}>{m.label} <span style={{ color: C.textG }}>({m.unit})</span></td>
+                                <td style={{ padding: '6px 12px', fontWeight: 700, color: stColor(st) }}>{v.value}</td>
+                                <td style={{ padding: '6px 12px', color: C.textD }}>{v.highAlarm}</td>
+                                <td style={{ padding: '6px 12px', color: C.textD }}>{v.highWarn}</td>
+                                <td style={{ padding: '6px 12px', color: C.textD }}>{v.lowWarn}</td>
+                                <td style={{ padding: '6px 12px', color: C.textD }}>{v.lowAlarm}</td>
+                                <td style={{ padding: '6px 12px' }}>
+                                  <Badge label={st === 'alarm' ? 'ALARME' : st === 'warn' ? 'ATENÇÃO' : 'OK'} color={stColor(st)} />
+                                </td>
+                              </tr>
+                            )
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          </Panel>
+        )
+      })}
+    </div>
+  )
+}
+
 // ─── Analytics Panel ──────────────────────────────────────────────────────
 function AnalyticsPanel({ switches }: { switches: SwitchData[] }) {
   if (!switches.length)
@@ -3684,6 +3938,141 @@ function buildTimelineWorksheet(switches: SwitchData[]): string {
   </Worksheet>`
 }
 
+// ── Inventário Global de Módulos SFP (todos os switches) ─────────────────────
+function buildSfpGlobalWorksheet(switches: SwitchData[]): string {
+  const swWithSfp = switches.filter(sw => sw.sfpInventory.length > 0)
+  const rows: string[] = []
+  rows.push(xlSectionRow('Inventário Global de Módulos SFP', 5))
+  if (swWithSfp.length === 0) {
+    rows.push(xlRow(xlCell('Nenhum módulo SFP identificado nos arquivos carregados.')))
+    return `<Worksheet ss:Name="Inventário SFP Global">
+    <Table ss:DefaultColumnWidth="150">${rows.join('\n      ')}</Table>
+  </Worksheet>`
+  }
+  rows.push(xlRow(xlHeader('Switch'), xlHeader('Porta (NAME)'), xlHeader('Descrição (DESCR)'), xlHeader('Modelo (PID)'), xlHeader('S/N')))
+  const pidCount = new Map<string, number>()
+  let total = 0
+  swWithSfp.forEach(sw => sw.sfpInventory.forEach(s => {
+    total++
+    const k = s.pid || '—'
+    pidCount.set(k, (pidCount.get(k) ?? 0) + 1)
+    rows.push(xlRow(xlCell(sw.hostname), xlCell(s.port), xlCell(s.descr), xlCell(s.pid), xlCell(s.sn)))
+  }))
+  rows.push(`<Row ss:AutoFitHeight="1"/>`)
+  // Resumo de padronização — total de módulos + contagem por PID.
+  rows.push(xlSectionRow(`Resumo — ${total} módulo(s) · ${pidCount.size} PID(s) distinto(s)`, 5))
+  rows.push(xlRow(xlHeader('Modelo (PID)'), xlHeader('Quantidade'), xlHeader(''), xlHeader(''), xlHeader('')))
+  ;[...pidCount.entries()].sort((a, b) => b[1] - a[1]).forEach(([pid, c]) =>
+    rows.push(xlRow(xlCell(pid), xlNum(c), xlCell(''), xlCell(''), xlCell(''))))
+  return `<Worksheet ss:Name="Inventário SFP Global">
+    <Table ss:DefaultColumnWidth="150">${rows.join('\n      ')}</Table>
+  </Worksheet>`
+}
+
+// ── Endereços IP por VLAN (todos os switches) ────────────────────────────────
+function buildIpVlanWorksheet(switches: SwitchData[]): string {
+  const rows: string[] = []
+  rows.push(xlSectionRow('Endereços IP por VLAN', 5))
+  const all: { host: string; vlan: string; ip: string; mask: string; gw: string }[] = []
+  switches.forEach(sw => sw.vlans.forEach(v =>
+    all.push({ host: sw.hostname, vlan: v.vlan, ip: v.ip, mask: v.mask, gw: sw.gateway })))
+  if (all.length === 0) {
+    rows.push(xlRow(xlCell('Nenhum endereço IP por VLAN identificado nos arquivos carregados.')))
+    return `<Worksheet ss:Name="IPs por VLAN">
+    <Table ss:DefaultColumnWidth="150">${rows.join('\n      ')}</Table>
+  </Worksheet>`
+  }
+  // Conflito de IP: mesmo IP em mais de um switch/VLAN (erro comum de rede).
+  const valid = (ip: string) => !!ip && !/^(N\/A|0\.0\.0\.0|—)?$/i.test(ip.trim()) && ip.trim() !== 'N/A'
+  const ipCount = new Map<string, number>()
+  all.forEach(r => { if (valid(r.ip)) ipCount.set(r.ip, (ipCount.get(r.ip) ?? 0) + 1) })
+  // Agrupado por VLAN (ordenadas numericamente) — um bloco por VLAN, com os IPs pertencentes.
+  const byVlan = new Map<string, typeof all>()
+  all.forEach(r => { const a = byVlan.get(r.vlan) ?? []; a.push(r); byVlan.set(r.vlan, a) })
+  const vlanKeys = [...byVlan.keys()].sort((a, b) =>
+    ((parseInt(a, 10) || 0) - (parseInt(b, 10) || 0)) || a.localeCompare(b))
+  vlanKeys.forEach(vk => {
+    const members = byVlan.get(vk)!
+    const grpDup = members.some(r => valid(r.ip) && (ipCount.get(r.ip) ?? 0) > 1)
+    rows.push(`<Row ss:AutoFitHeight="1"/>`)
+    rows.push(xlSectionRow(`VLAN ${vk} — ${members.length} host(s)${grpDup ? '  ⚠ IP duplicado' : ''}`, 5))
+    rows.push(xlRow(xlHeader('Switch'), xlHeader('Endereço IP'), xlHeader('Máscara'), xlHeader('Gateway'), xlHeader('')))
+    members.forEach(r => {
+      const dup = valid(r.ip) && (ipCount.get(r.ip) ?? 0) > 1
+      rows.push(xlRow(
+        xlCell(r.host), xlWarnCell(r.ip || '—', dup), xlCell(r.mask || '—'), xlCell(r.gw || '—'), xlCell(''),
+      ))
+    })
+  })
+  const conflicts = [...ipCount.entries()].filter(([, c]) => c > 1)
+  if (conflicts.length > 0) {
+    rows.push(`<Row ss:AutoFitHeight="1"/>`)
+    rows.push(xlSectionRow(`⚠ IPs duplicados entre switches — ${conflicts.length}`, 5))
+    rows.push(xlRow(xlHeader('Endereço IP'), xlHeader('Ocorrências'), xlHeader(''), xlHeader(''), xlHeader('')))
+    conflicts.sort((a, b) => b[1] - a[1]).forEach(([ip, c]) =>
+      rows.push(xlRow(xlWarnCell(ip, true), xlNum(c), xlCell(''), xlCell(''), xlCell(''))))
+  }
+  return `<Worksheet ss:Name="IPs por VLAN">
+    <Table ss:DefaultColumnWidth="150">${rows.join('\n      ')}</Table>
+  </Worksheet>`
+}
+
+// ── Transceiver Detail — Diagnóstico Óptico (DOM) Global ──────────────────────
+function buildTransceiverWorksheet(switches: SwitchData[]): string {
+  const swWithTx = switches.filter(sw => sw.transceivers.length > 0)
+  const rows: string[] = []
+  rows.push(xlSectionRow('Transceiver Detail — Diagnóstico Óptico (DOM) Global', 9))
+  if (swWithTx.length === 0) {
+    rows.push(xlRow(xlCell('Nenhum dado de transceiver óptico (DOM) encontrado nos arquivos carregados.')))
+    return `<Worksheet ss:Name="Transceiver DOM">
+    <Table ss:DefaultColumnWidth="120">${rows.join('\n      ')}</Table>
+  </Worksheet>`
+  }
+  const txMetrics: { key: keyof TransceiverEntry; label: string }[] = [
+    { key: 'temperature', label: 'Temperatura (°C)' },
+    { key: 'voltage',     label: 'Voltagem (V)' },
+    { key: 'current',     label: 'Corrente (mA)' },
+    { key: 'txPower',     label: 'Potência Tx (dBm)' },
+    { key: 'rxPower',     label: 'Potência Rx (dBm)' },
+  ]
+  let nAlarm = 0, nWarn = 0
+  swWithTx.forEach(sw => sw.transceivers.forEach(tx => txMetrics.forEach(m => {
+    const st = txStatus(tx[m.key] as TxMetric | null)
+    if (st === 'alarm') nAlarm++; else if (st === 'warn') nWarn++
+  })))
+  rows.push(xlSectionRow(`Resumo — ${nAlarm} métrica(s) em ALARME · ${nWarn} em ATENÇÃO`, 8))
+  // Um bloco por switch (cabeçalho de seção com o hostname + linha em branco), para separar
+  // visualmente os dados de cada switch. A coluna Switch sai (fica no cabeçalho do bloco).
+  swWithTx.forEach(sw => {
+    const swAlarm = sw.transceivers.reduce((s, tx) => s + txMetrics.filter(m => txStatus(tx[m.key] as TxMetric | null) === 'alarm').length, 0)
+    const swWarn  = sw.transceivers.reduce((s, tx) => s + txMetrics.filter(m => txStatus(tx[m.key] as TxMetric | null) === 'warn').length, 0)
+    rows.push(`<Row ss:AutoFitHeight="1"/>`)
+    rows.push(xlSectionRow(`${sw.hostname} — ${swAlarm} alarme(s) · ${swWarn} atenção`, 8))
+    rows.push(xlRow(
+      xlHeader('Porta'), xlHeader('Métrica'), xlHeader('Valor'),
+      xlHeader('High Alarm'), xlHeader('High Warn'), xlHeader('Low Warn'), xlHeader('Low Alarm'),
+      xlHeader('Status'),
+    ))
+    sw.transceivers.forEach(tx => txMetrics.forEach(m => {
+      const v = tx[m.key] as TxMetric | null
+      if (!v) return
+      const st = txStatus(v)
+      const warn = st === 'alarm' || st === 'warn'
+      rows.push(xlRow(
+        xlCell(tx.port), xlCell(m.label),
+        xlWarnCell(String(v.value), warn),
+        xlCell(String(v.highAlarm)), xlCell(String(v.highWarn)),
+        xlCell(String(v.lowWarn)), xlCell(String(v.lowAlarm)),
+        xlAlertCell(st === 'alarm' ? 'ALARME' : st === 'warn' ? 'ATENÇÃO' : 'OK',
+          st === 'alarm' ? 'alarm' : st === 'warn' ? 'attn' : 'ok'),
+      ))
+    }))
+  })
+  return `<Worksheet ss:Name="Transceiver DOM">
+    <Table ss:DefaultColumnWidth="140">${rows.join('\n      ')}</Table>
+  </Worksheet>`
+}
+
 
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -4017,7 +4406,9 @@ function exportToWord(switches: SwitchData[], netIntel: NetIntel) {
     { n: '4.', t: 'Análise Detalhada por Switch',          cls: 'MsoToc1' },
     ...switches.map((sw, i) => ({ n: `4.${i+1}.`, t: sw.hostname, cls: 'MsoToc2' })),
     { n: '5.', t: 'Inventário Global de Módulos SFP',      cls: 'MsoToc1' },
-    { n: '6.', t: 'Conclusão e Recomendações',             cls: 'MsoToc1' },
+    { n: '6.', t: 'Endereços IP por VLAN',                 cls: 'MsoToc1' },
+    { n: '7.', t: 'Diagnóstico Óptico Global (DOM)',       cls: 'MsoToc1' },
+    { n: '8.', t: 'Conclusão e Recomendações',             cls: 'MsoToc1' },
   ]
   body.push(tocSections.map(({ n, t, cls }) =>
     `<p class="${cls}" style="tab-stops:right dotted 450pt">
@@ -4446,10 +4837,117 @@ function exportToWord(switches: SwitchData[], netIntel: NetIntel) {
   }
 
   // ══════════════════════════════════════════════════════════════════════
-  // SECTION 6: CONCLUSÃO E RECOMENDAÇÕES (dense, dissertative)
+  // SECTION 6: ENDEREÇOS IP POR VLAN (global)
   // ══════════════════════════════════════════════════════════════════════
   body.push(PAGE_BREAK)
-  body.push(`<a name="_Toc_6" id="_Toc_6"></a><h2>6. Conclusão e Recomendações</h2>`)
+  body.push(`<a name="_Toc_6" id="_Toc_6"></a><h2>6. Endereços IP por VLAN</h2>`)
+  {
+    const allIp = switches.flatMap(sw => sw.vlans.map(v => ({
+      host: sw.hostname, vlan: v.vlan, ip: v.ip, mask: v.mask, gw: sw.gateway,
+    })))
+    const validIp = (ip: string) => !!ip && ip.trim() !== '' && ip.trim() !== 'N/A' && ip.trim() !== '0.0.0.0' && ip.trim() !== '—'
+    const ipCount = new Map<string, number>()
+    allIp.forEach(r => { if (validIp(r.ip)) ipCount.set(r.ip, (ipCount.get(r.ip) ?? 0) + 1) })
+    const conflicts = [...ipCount.entries()].filter(([, c]) => c > 1).sort((a, b) => b[1] - a[1])
+    if (allIp.length === 0) {
+      body.push(`<p class="dim">Nenhum endereço IP por VLAN (SVI) identificado nos arquivos carregados.</p>`)
+    } else {
+      if (conflicts.length > 0) {
+        body.push(`<p class="warn" style="font-size:8.5pt;margin:3pt 0">⚠ ${conflicts.length} endereço(s) IP duplicado(s) entre switches: ${esc(conflicts.map(([ip, c]) => `${ip} (${c}×)`).join('  ·  '))}</p>`)
+      }
+      // Agrupado por VLAN (ordenadas numericamente) — os IPs de cada VLAN ficam juntos.
+      const byVlan = new Map<string, typeof allIp>()
+      allIp.forEach(r => { const a = byVlan.get(r.vlan) ?? []; a.push(r); byVlan.set(r.vlan, a) })
+      const vlanKeys = [...byVlan.keys()].sort((a, b) =>
+        ((parseInt(a, 10) || 0) - (parseInt(b, 10) || 0)) || a.localeCompare(b))
+      vlanKeys.forEach(vk => {
+        const members = byVlan.get(vk)!
+        const grpDup = members.some(r => validIp(r.ip) && (ipCount.get(r.ip) ?? 0) > 1)
+        body.push(`<h3 style="margin:6pt 0 2pt">VLAN ${esc(vk)}
+          <span style="font-weight:normal;color:${CLR.gray50};font-size:9pt"> — ${members.length} host(s)</span>
+          ${grpDup ? `<span class="warn" style="font-size:9pt"> ⚠ IP duplicado</span>` : ''}
+        </h3>`)
+        body.push(`<table style="font-size:8pt">
+          <thead>${thRow('Switch', 'Endereço IP', 'Máscara', 'Gateway')}</thead>
+          <tbody>${members.map(r => {
+            const dup = validIp(r.ip) && (ipCount.get(r.ip) ?? 0) > 1
+            return `<tr>
+              <td><strong>${esc(r.host)}</strong></td>
+              <td class="${dup ? 'warn' : ''}">${esc(r.ip || '—')}${dup ? ' ⚠' : ''}</td>
+              <td class="dim">${esc(r.mask || '—')}</td>
+              <td class="dim">${esc(r.gw || '—')}</td>
+            </tr>`
+          }).join('')}</tbody>
+        </table>`)
+      })
+    }
+  }
+
+  // ══════════════════════════════════════════════════════════════════════
+  // SECTION 7: DIAGNÓSTICO ÓPTICO GLOBAL (DOM)
+  // ══════════════════════════════════════════════════════════════════════
+  body.push(PAGE_BREAK)
+  body.push(`<a name="_Toc_7" id="_Toc_7"></a><h2>7. Diagnóstico Óptico Global — Transceiver Detail (DOM)</h2>`)
+  {
+    const swWithTx = switches.filter(sw => sw.transceivers.length > 0)
+    if (swWithTx.length === 0) {
+      body.push(`<p class="dim">Nenhum dado de transceiver óptico (DOM) encontrado nos arquivos carregados.</p>`)
+    } else {
+      const txMetricsG: { key: keyof TransceiverEntry; label: string }[] = [
+        { key: 'temperature', label: 'Temperatura (°C)' },
+        { key: 'voltage',     label: 'Voltagem (V)' },
+        { key: 'current',     label: 'Corrente (mA)' },
+        { key: 'txPower',     label: 'Potência Tx (dBm)' },
+        { key: 'rxPower',     label: 'Potência Rx (dBm)' },
+      ]
+      let nAlarm = 0, nWarn = 0
+      swWithTx.forEach(sw => sw.transceivers.forEach(tx => txMetricsG.forEach(m => {
+        const st = txStatus(tx[m.key] as TxMetric | null)
+        if (st === 'alarm') nAlarm++; else if (st === 'warn') nWarn++
+      })))
+      body.push(`<p style="font-size:8.5pt;margin:2pt 0">Resumo: <strong style="color:${nAlarm > 0 ? CLR.red : CLR.green}">${nAlarm} métrica(s) em ALARME</strong> · <strong style="color:${nWarn > 0 ? CLR.orange : CLR.green}">${nWarn} em ATENÇÃO</strong>.</p>`)
+      // Um bloco por switch (mesmo formato do Inventário Global de SFP) — legível por switch,
+      // sem a coluna Switch (redundante sob o h3) e com mini-resumo das portas em alerta.
+      swWithTx.forEach(sw => {
+        const portAlarms = sw.transceivers
+          .map(tx => ({ port: tx.port, n: txMetricsG.filter(m => txStatus(tx[m.key] as TxMetric | null) === 'alarm').length }))
+          .filter(p => p.n > 0)
+        const portWarns = sw.transceivers
+          .map(tx => ({ port: tx.port, n: txMetricsG.filter(m => txStatus(tx[m.key] as TxMetric | null) === 'warn').length }))
+          .filter(p => p.n > 0)
+        const miniParts: string[] = []
+        if (portAlarms.length) miniParts.push(`<span class="warn">Alarme: ${esc(portAlarms.map(p => `${p.port} (${p.n})`).join(', '))}</span>`)
+        if (portWarns.length)  miniParts.push(`<span style="color:${CLR.orange}">Atenção: ${esc(portWarns.map(p => `${p.port} (${p.n})`).join(', '))}</span>`)
+        body.push(`<h3>${esc(sw.hostname)}</h3>`)
+        if (miniParts.length) body.push(`<p style="font-size:8pt;margin:1pt 0 3pt">${miniParts.join('  ·  ')}</p>`)
+        body.push(`<table style="font-size:8pt">
+          <thead>${thRow('Porta', 'Métrica', 'Valor', 'High Alarm', 'High Warn', 'Low Warn', 'Low Alarm', 'Status')}</thead>
+          <tbody>${sw.transceivers.flatMap(tx => {
+            const portAlarm = txMetricsG.some(m => txStatus(tx[m.key] as TxMetric | null) === 'alarm')
+            return txMetricsG.map(m => {
+              const v = tx[m.key] as TxMetric | null
+              if (!v) return ''
+              const st = txStatus(v)
+              const lbl = st === 'alarm' ? 'ALARME' : st === 'warn' ? 'ATENÇÃO' : 'OK'
+              return `<tr${portAlarm ? ' style="background:#fff1f1"' : ''}>
+                <td><strong>${esc(tx.port)}</strong></td>
+                <td class="dim">${esc(m.label)}</td>
+                <td class="${st === 'ok' ? '' : 'warn'}">${esc(String(v.value))}</td>
+                <td class="dim">${esc(String(v.highAlarm))}</td><td class="dim">${esc(String(v.highWarn))}</td>
+                <td class="dim">${esc(String(v.lowWarn))}</td><td class="dim">${esc(String(v.lowAlarm))}</td>
+                <td class="${st === 'ok' ? 'ok' : 'warn'}">${lbl}</td></tr>`
+            }).join('')
+          }).join('')}</tbody>
+        </table>`)
+      })
+    }
+  }
+
+  // ══════════════════════════════════════════════════════════════════════
+  // SECTION 8: CONCLUSÃO E RECOMENDAÇÕES (dense, dissertative)
+  // ══════════════════════════════════════════════════════════════════════
+  body.push(PAGE_BREAK)
+  body.push(`<a name="_Toc_8" id="_Toc_8"></a><h2>8. Conclusão e Recomendações</h2>`)
 
   const conclusionText = hasIssues
     ? `Com base na análise técnica realizada em <strong>${esc(dateStr)}</strong>, a infraestrutura de rede avaliada apresenta condições que demandam intervenção técnica imediata e planejamento preventivo estruturado. Foram identificados <strong>${critSwCount}</strong> dispositivo(s) em estado crítico, <strong>${totalCrit}</strong> evento(s) de severidade CRITICAL nos buffers de log e <strong>${tempFaults}</strong> alerta(s) de temperatura operacional acima dos limiares configurados pelo fabricante. Esses indicadores, isoladamente, já constituem fatores de risco para a continuidade operacional; em conjunto, elevam exponencialmente a probabilidade de um <em>Downtime</em> não planejado.`
@@ -4594,11 +5092,16 @@ function exportToExcel(switches: SwitchData[]) {
   </Styles>`
 
   const analyticsSheet  = buildAnalyticsWorksheet(switches)
+  const sfpGlobalSheet  = buildSfpGlobalWorksheet(switches)
+  const ipVlanSheet     = buildIpVlanWorksheet(switches)
+  const transceiverSheet = buildTransceiverWorksheet(switches)
   const timelineSheet   = buildTimelineWorksheet(switches)
 
   // Deduplicate worksheet names — Excel corrupts the workbook if two sheets share the same name.
-  // Start with 'Analytics' already reserved so detail sheets never collide with it.
-  const usedNames = new Set<string>(['Analytics', 'Linha do Tempo'])
+  // Reserve the fixed global sheet names so per-switch detail sheets never collide with them.
+  const usedNames = new Set<string>([
+    'Analytics', 'Inventário SFP Global', 'IPs por VLAN', 'Transceiver DOM', 'Linha do Tempo',
+  ])
   const detailSheets = switches.map((sw) => {
     const base = sw.hostname.replace(/[^a-zA-Z0-9_\-]/g, '_').slice(0, 28)
     let name = base
@@ -4618,6 +5121,9 @@ function exportToExcel(switches: SwitchData[]) {
   xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet">
   ${styles}
   ${analyticsSheet}
+  ${sfpGlobalSheet}
+  ${ipVlanSheet}
+  ${transceiverSheet}
   ${timelineSheet}
   ${detailSheets}
 </Workbook>`
@@ -4915,7 +5421,7 @@ function SecurityView({ netIntel }: { netIntel: NetIntel }) {
 
 // ─── Main Component ───────────────────────────────────────────────────────
 type TabId     = 'cpu' | 'memory' | 'network' | 'env' | 'stp' | 'config' | 'dlr' | 'interfaces' | 'transceiver' | 'inventory'
-type ViewMode  = 'detail' | 'analytics' | 'timeline' | 'security'
+type ViewMode  = 'detail' | 'analytics' | 'sfpGlobal' | 'ipVlan' | 'transceiverGlobal' | 'timeline' | 'security'
 
 const TABS: { id: TabId; icon: string; label: string }[] = [
   { id: 'cpu',       icon: '⚡', label: 'CPU'        },
@@ -5049,6 +5555,9 @@ export default function ShowtechView() {
           {([
             { id: 'detail'    as ViewMode, icon: '🔧', label: 'Troubleshooting' },
             { id: 'analytics' as ViewMode, icon: '📊', label: 'Analytics'       },
+            { id: 'sfpGlobal' as ViewMode, icon: '🔌', label: 'SFP Global'      },
+            { id: 'ipVlan'    as ViewMode, icon: '🌐', label: 'IPs por VLAN'    },
+            { id: 'transceiverGlobal' as ViewMode, icon: '🔬', label: 'Transceiver DOM' },
             { id: 'timeline'  as ViewMode, icon: '🕐', label: 'Linha do Tempo'  },
             { id: 'security'  as ViewMode, icon: '🔒', label: 'Segurança'       },
           ]).map((v) => (
@@ -5132,6 +5641,21 @@ export default function ShowtechView() {
         {/* ── Analytics view ──────────────────────────────────────────── */}
         {viewMode === 'analytics' && (
           <AnalyticsPanel switches={switches} />
+        )}
+
+        {/* ── SFP Global view ─────────────────────────────────────────── */}
+        {viewMode === 'sfpGlobal' && (
+          <SfpGlobalView switches={switches} />
+        )}
+
+        {/* ── IPs por VLAN view ───────────────────────────────────────── */}
+        {viewMode === 'ipVlan' && (
+          <IpVlanView switches={switches} />
+        )}
+
+        {/* ── Transceiver DOM (global) view ───────────────────────────── */}
+        {viewMode === 'transceiverGlobal' && (
+          <TransceiverGlobalView switches={switches} />
         )}
 
         {/* ── Timeline view ───────────────────────────────────────────── */}
