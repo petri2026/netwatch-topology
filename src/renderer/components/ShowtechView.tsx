@@ -1617,16 +1617,26 @@ function sfpAlarms(sw: SwitchData): { alarms: string[]; warns: string[] } {
 // measured value plus High/Low Alarm and Warn thresholds. Works with proper show-tech
 // section headers and manual terminal captures (which lack "--- show ---" delimiters).
 function parseTransceivers(text: string): TransceiverEntry[] {
-  const cmdM = text.match(/^.*show interfaces?\s+trans(?:ceiver)?\s+detail.*$/im)
-  let region: string
-  if (cmdM && cmdM.index !== undefined) {
-    const after = text.slice(cmdM.index + cmdM[0].length)
+  // Marker of a real DOM sub-table (used to tell the actual command output apart from echoes).
+  const DOM_TABLE = /(?:Temperature|Voltage|Current|Transmit Power|Receive Power)\s+Threshold/i
+  // IOS command-accounting echoes the command as a bare "CMD: 'show ... transceiver detail'"
+  // audit line (followed by logs, not a table), so the FIRST occurrence isn't necessarily the
+  // output. Scan every occurrence and keep the first region that actually holds a DOM table.
+  let region = ''
+  const cmdRe = /show interfaces?\s+trans(?:ceiver)?\s+detail.*$/gim
+  let cm: RegExpExecArray | null
+  while ((cm = cmdRe.exec(text)) !== null) {
+    const after = text.slice(cm.index + cm[0].length)
     const end = after.search(/\n\S+[#>]\s*\w|\n---+\s*show/i)   // next command prompt / section
-    region = end > 0 ? after.slice(0, end) : after.slice(0, 6000)
-  } else {
+    const cand = end > 0 ? after.slice(0, end) : after.slice(0, 6000)
+    if (DOM_TABLE.test(cand)) { region = cand; break }
+    if (cm.index === cmdRe.lastIndex) cmdRe.lastIndex++
+  }
+  // Fallback: no command line (or none with a table) — locate the table header directly.
+  if (!region) {
     const m = text.search(/^\s*(?:Temperature|Voltage|Optical)\b.*Threshold/im)
     if (m < 0) return []
-    region = text.slice(m, m + 4000)
+    region = text.slice(m, m + 6000)
   }
 
   const metricRe: [RegExp, keyof TransceiverEntry][] = [
@@ -2924,18 +2934,18 @@ function TransceiverGlobalView({ switches }: { switches: SwitchData[] }) {
                         <tbody>
                           {metrics.map((m, i) => {
                             const v = tx[m.key] as TxMetric | null
-                            if (!v) return null
                             const st = txStatus(v)
+                            const nd = !v   // métrica não reportada pelo transceptor
                             return (
                               <tr key={m.key} style={{ borderBottom: `1px solid ${C.border}`, background: i % 2 ? C.surface : 'transparent' }}>
                                 <td style={{ padding: '6px 12px', color: C.text }}>{m.label} <span style={{ color: C.textG }}>({m.unit})</span></td>
-                                <td style={{ padding: '6px 12px', fontWeight: 700, color: stColor(st) }}>{v.value}</td>
-                                <td style={{ padding: '6px 12px', color: C.textD }}>{v.highAlarm}</td>
-                                <td style={{ padding: '6px 12px', color: C.textD }}>{v.highWarn}</td>
-                                <td style={{ padding: '6px 12px', color: C.textD }}>{v.lowWarn}</td>
-                                <td style={{ padding: '6px 12px', color: C.textD }}>{v.lowAlarm}</td>
+                                <td style={{ padding: '6px 12px', fontWeight: 700, color: nd ? C.textG : stColor(st), fontStyle: nd ? 'italic' : undefined }}>{v ? v.value : 'N/D'}</td>
+                                <td style={{ padding: '6px 12px', color: C.textD }}>{v ? v.highAlarm : '—'}</td>
+                                <td style={{ padding: '6px 12px', color: C.textD }}>{v ? v.highWarn : '—'}</td>
+                                <td style={{ padding: '6px 12px', color: C.textD }}>{v ? v.lowWarn : '—'}</td>
+                                <td style={{ padding: '6px 12px', color: C.textD }}>{v ? v.lowAlarm : '—'}</td>
                                 <td style={{ padding: '6px 12px' }}>
-                                  <Badge label={st === 'alarm' ? 'ALARME' : st === 'warn' ? 'ATENÇÃO' : 'OK'} color={stColor(st)} />
+                                  <Badge label={nd ? 'N/D' : st === 'alarm' ? 'ALARME' : st === 'warn' ? 'ATENÇÃO' : 'OK'} color={nd ? C.textG : stColor(st)} />
                                 </td>
                               </tr>
                             )
@@ -3673,7 +3683,13 @@ function buildWorksheet(sw: SwitchData, sheetName?: string): string {
     sw.transceivers.forEach(tx => {
       txMetrics.forEach(m => {
         const v = tx[m.key] as TxMetric | null
-        if (!v) return
+        if (!v) {   // métrica não reportada pelo transceptor → N/D (não omitir)
+          rows.push(xlRow(
+            xlCell(tx.port), xlCell(m.label),
+            xlCell('N/D'), xlCell('—'), xlCell('—'), xlCell('—'), xlCell('—'), xlCell('N/D'),
+          ))
+          return
+        }
         const st = txStatus(v)
         const warn = st === 'alarm' || st === 'warn'
         rows.push(xlRow(
@@ -4055,7 +4071,14 @@ function buildTransceiverWorksheet(switches: SwitchData[]): string {
     ))
     sw.transceivers.forEach(tx => txMetrics.forEach(m => {
       const v = tx[m.key] as TxMetric | null
-      if (!v) return
+      if (!v) {   // métrica não reportada pelo transceptor → N/D (não omitir)
+        rows.push(xlRow(
+          xlCell(tx.port), xlCell(m.label),
+          xlCell('N/D'), xlCell('—'), xlCell('—'), xlCell('—'), xlCell('—'),
+          xlAlertCell('N/D', 'ok'),
+        ))
+        return
+      }
       const st = txStatus(v)
       const warn = st === 'alarm' || st === 'warn'
       rows.push(xlRow(
@@ -4729,7 +4752,15 @@ function exportToWord(switches: SwitchData[], netIntel: NetIntel) {
           const portAlarm = txMetricsW.some(m => txStatus(tx[m.key] as TxMetric | null) === 'alarm')
           txMetricsW.forEach(m => {
             const v = tx[m.key] as TxMetric | null
-            if (!v) return
+            if (!v) {   // métrica não reportada pelo transceptor → N/D (não omitir)
+              txRows.push(`<tr${portAlarm ? ' style="background:#fff1f1"' : ''}>
+                <td><strong>${esc(tx.port)}</strong></td><td class="dim">${esc(m.label)}</td>
+                <td class="dim">N/D</td>
+                <td class="dim">—</td><td class="dim">—</td>
+                <td class="dim">—</td><td class="dim">—</td>
+                <td class="dim">N/D</td></tr>`)
+              return
+            }
             const st = txStatus(v)
             const cls = st === 'alarm' ? 'warn' : st === 'warn' ? 'warn' : 'ok'
             const lbl = st === 'alarm' ? 'ALARME' : st === 'warn' ? 'ATENÇÃO' : 'OK'
@@ -4926,7 +4957,15 @@ function exportToWord(switches: SwitchData[], netIntel: NetIntel) {
             const portAlarm = txMetricsG.some(m => txStatus(tx[m.key] as TxMetric | null) === 'alarm')
             return txMetricsG.map(m => {
               const v = tx[m.key] as TxMetric | null
-              if (!v) return ''
+              if (!v) {   // métrica não reportada pelo transceptor → N/D (não omitir)
+                return `<tr${portAlarm ? ' style="background:#fff1f1"' : ''}>
+                  <td><strong>${esc(tx.port)}</strong></td>
+                  <td class="dim">${esc(m.label)}</td>
+                  <td class="dim">N/D</td>
+                  <td class="dim">—</td><td class="dim">—</td>
+                  <td class="dim">—</td><td class="dim">—</td>
+                  <td class="dim">N/D</td></tr>`
+              }
               const st = txStatus(v)
               const lbl = st === 'alarm' ? 'ALARME' : st === 'warn' ? 'ATENÇÃO' : 'OK'
               return `<tr${portAlarm ? ' style="background:#fff1f1"' : ''}>
@@ -7192,18 +7231,18 @@ export default function ShowtechView() {
                                               <tbody>
                                                 {metrics.map((m, i) => {
                                                   const v = tx[m.key] as TxMetric | null
-                                                  if (!v) return null
                                                   const st = txStatus(v)
+                                                  const nd = !v   // métrica não reportada pelo transceptor
                                                   return (
                                                     <tr key={m.key} style={{ borderBottom: `1px solid ${C.border}`, background: i % 2 ? C.surface : 'transparent' }}>
                                                       <td style={{ padding: '6px 12px', color: C.text }}>{m.label} <span style={{ color: C.textG }}>({m.unit})</span></td>
-                                                      <td style={{ padding: '6px 12px', fontWeight: 700, color: stColor(st) }}>{v.value}</td>
-                                                      <td style={{ padding: '6px 12px', color: C.textD }}>{v.highAlarm}</td>
-                                                      <td style={{ padding: '6px 12px', color: C.textD }}>{v.highWarn}</td>
-                                                      <td style={{ padding: '6px 12px', color: C.textD }}>{v.lowWarn}</td>
-                                                      <td style={{ padding: '6px 12px', color: C.textD }}>{v.lowAlarm}</td>
+                                                      <td style={{ padding: '6px 12px', fontWeight: 700, color: nd ? C.textG : stColor(st), fontStyle: nd ? 'italic' : undefined }}>{v ? v.value : 'N/D'}</td>
+                                                      <td style={{ padding: '6px 12px', color: C.textD }}>{v ? v.highAlarm : '—'}</td>
+                                                      <td style={{ padding: '6px 12px', color: C.textD }}>{v ? v.highWarn : '—'}</td>
+                                                      <td style={{ padding: '6px 12px', color: C.textD }}>{v ? v.lowWarn : '—'}</td>
+                                                      <td style={{ padding: '6px 12px', color: C.textD }}>{v ? v.lowAlarm : '—'}</td>
                                                       <td style={{ padding: '6px 12px' }}>
-                                                        <Badge label={st === 'alarm' ? 'ALARME' : st === 'warn' ? 'ATENÇÃO' : 'OK'} color={stColor(st)} />
+                                                        <Badge label={nd ? 'N/D' : st === 'alarm' ? 'ALARME' : st === 'warn' ? 'ATENÇÃO' : 'OK'} color={nd ? C.textG : stColor(st)} />
                                                       </td>
                                                     </tr>
                                                   )
