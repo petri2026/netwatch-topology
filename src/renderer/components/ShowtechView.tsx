@@ -12,6 +12,7 @@ interface MemInfo {
 }
 interface VlanEntry {
   vlan: string; ip: string; mask: string
+  mac?: string   // endereço de hardware da SVI (de "show interfaces": Hardware is ..., address is ...)
 }
 interface CpuPoint {
   max: number; avg: number
@@ -884,9 +885,26 @@ function parseMemory(text: string): MemInfo | null {
   return { total, used, free, pct: parseFloat(((used / total) * 100).toFixed(1)) }
 }
 
+// MAC (endereço de hardware) de cada SVI, de "show interfaces":
+//   "Vlan1 is up, ... Hardware is Ethernet SVI, address is 0861.9503.66bb (bia ...)"
+// Tolerante a: bloco em linhas separadas, bloco colapsado numa linha (MobaXterm RTF) e aos
+// descritores "EtherSVI"/"Ethernet SVI". Em muitos switches todas as SVIs compartilham a
+// mesma base MAC — comportamento normal do IOS.
+function parseSviMacs(text: string): Record<string, string> {
+  const map: Record<string, string> = {}
+  const re = /\bVlan(\d+)\b is [\s\S]{0,200}?Hardware is [^\n]{0,80}?address is ([0-9a-f]{4}\.[0-9a-f]{4}\.[0-9a-f]{4})/gi
+  let m: RegExpExecArray | null
+  while ((m = re.exec(text)) !== null) {
+    if (!map[m[1]]) map[m[1]] = m[2].toLowerCase()
+    if (m.index === re.lastIndex) re.lastIndex++
+  }
+  return map
+}
+
 function parseNetwork(text: string) {
   const gm = text.match(/ip default-gateway\s+(\S+)/i)
   const gateway = gm ? gm[1] : 'N/A'
+  const sviMacs = parseSviMacs(text)
   const vlans: VlanEntry[] = []
   const seen = new Set<string>()
   const re = /interface\s+[Vv]lan(\d+)([\s\S]{0,400}?)(?=\ninterface|\nip |\n!)/g
@@ -895,7 +913,7 @@ function parseNetwork(text: string) {
     const ip = m[2].match(/ip\s+address\s+(\d+\.\d+\.\d+\.\d+)\s+(\d+\.\d+\.\d+\.\d+)/)
     if (ip) {
       const key = `${m[1]}-${ip[1]}`
-      if (!seen.has(key)) { seen.add(key); vlans.push({ vlan: m[1], ip: ip[1], mask: ip[2] }) }
+      if (!seen.has(key)) { seen.add(key); vlans.push({ vlan: m[1], ip: ip[1], mask: ip[2], mac: sviMacs[m[1]] }) }
     }
   }
   return { gateway, vlans }
@@ -2806,7 +2824,7 @@ function IpVlanView({ switches }: { switches: SwitchData[] }) {
     return <EmptyGlobal icon="🌐" text="Carregue arquivos RTF para visualizar os endereços IP por VLAN." />
 
   const all = switches.flatMap(sw => sw.vlans.map(v => ({
-    host: sw.hostname, vlan: v.vlan, ip: v.ip, mask: v.mask, gw: sw.gateway,
+    host: sw.hostname, vlan: v.vlan, ip: v.ip, mask: v.mask, gw: sw.gateway, mac: v.mac,
   })))
   if (!all.length)
     return <EmptyGlobal icon="🌐" text="Nenhum endereço IP por VLAN (SVI) identificado nos arquivos carregados." />
@@ -2836,7 +2854,7 @@ function IpVlanView({ switches }: { switches: SwitchData[] }) {
         right={<span style={{ fontSize: 9, fontFamily: C.mono, color: C.textG }}>{vlanKeys.length} VLAN(s) · {all.length} interface(s) · {switches.length} switch(es)</span>}>
         <div style={{ overflowX: 'auto', overflowY: 'auto', maxHeight: 560, border: `1px solid ${C.border}`, borderRadius: 8 }}>
           <table style={{ width: '100%', borderCollapse: 'collapse' }}>
-            <thead><tr><GTh>Switch</GTh><GTh>Endereço IP</GTh><GTh>Máscara</GTh><GTh>Gateway</GTh></tr></thead>
+            <thead><tr><GTh>Switch</GTh><GTh>Endereço IP</GTh><GTh>Máscara</GTh><GTh>Gateway</GTh><GTh>MAC (SVI)</GTh></tr></thead>
             <tbody>
               {vlanKeys.map(vk => {
                 const members = byVlan.get(vk)!
@@ -2845,7 +2863,7 @@ function IpVlanView({ switches }: { switches: SwitchData[] }) {
                   <Fragment key={vk}>
                     {/* Sub-cabeçalho da VLAN */}
                     <tr>
-                      <td colSpan={4} style={{
+                      <td colSpan={5} style={{
                         padding: '6px 12px', background: grpDup ? 'rgba(239,68,68,0.10)' : `${C.purple}14`,
                         borderTop: `1px solid ${C.border}`, borderBottom: `1px solid ${C.border}`,
                         fontFamily: C.mono, fontSize: 10, fontWeight: 700,
@@ -2864,6 +2882,7 @@ function IpVlanView({ switches }: { switches: SwitchData[] }) {
                           <GTd warn={dup} color={C.cyan}>{r.ip || '—'}{dup && ' ⚠'}</GTd>
                           <GTd color={C.textD}>{r.mask || '—'}</GTd>
                           <GTd color={C.textD}>{r.gw || '—'}</GTd>
+                          <GTd color={C.textD}>{r.mac || '—'}</GTd>
                         </tr>
                       )
                     })}
@@ -3989,9 +4008,9 @@ function buildSfpGlobalWorksheet(switches: SwitchData[]): string {
 function buildIpVlanWorksheet(switches: SwitchData[]): string {
   const rows: string[] = []
   rows.push(xlSectionRow('Endereços IP por VLAN', 5))
-  const all: { host: string; vlan: string; ip: string; mask: string; gw: string }[] = []
+  const all: { host: string; vlan: string; ip: string; mask: string; gw: string; mac?: string }[] = []
   switches.forEach(sw => sw.vlans.forEach(v =>
-    all.push({ host: sw.hostname, vlan: v.vlan, ip: v.ip, mask: v.mask, gw: sw.gateway })))
+    all.push({ host: sw.hostname, vlan: v.vlan, ip: v.ip, mask: v.mask, gw: sw.gateway, mac: v.mac })))
   if (all.length === 0) {
     rows.push(xlRow(xlCell('Nenhum endereço IP por VLAN identificado nos arquivos carregados.')))
     return `<Worksheet ss:Name="IPs por VLAN">
@@ -4012,11 +4031,11 @@ function buildIpVlanWorksheet(switches: SwitchData[]): string {
     const grpDup = members.some(r => valid(r.ip) && (ipCount.get(r.ip) ?? 0) > 1)
     rows.push(`<Row ss:AutoFitHeight="1"/>`)
     rows.push(xlSectionRow(`VLAN ${vk} — ${members.length} host(s)${grpDup ? '  ⚠ IP duplicado' : ''}`, 5))
-    rows.push(xlRow(xlHeader('Switch'), xlHeader('Endereço IP'), xlHeader('Máscara'), xlHeader('Gateway'), xlHeader('')))
+    rows.push(xlRow(xlHeader('Switch'), xlHeader('Endereço IP'), xlHeader('Máscara'), xlHeader('Gateway'), xlHeader('MAC (SVI)')))
     members.forEach(r => {
       const dup = valid(r.ip) && (ipCount.get(r.ip) ?? 0) > 1
       rows.push(xlRow(
-        xlCell(r.host), xlWarnCell(r.ip || '—', dup), xlCell(r.mask || '—'), xlCell(r.gw || '—'), xlCell(''),
+        xlCell(r.host), xlWarnCell(r.ip || '—', dup), xlCell(r.mask || '—'), xlCell(r.gw || '—'), xlCell(r.mac || '—'),
       ))
     })
   })
