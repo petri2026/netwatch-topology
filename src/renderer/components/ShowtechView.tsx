@@ -951,8 +951,22 @@ function parseVersion(text: string) {
       })()
     : text.slice(0, 3000)
 
-  const fw  = section.match(/Version\s+([\d.()\w-]+),?\s*RELEASE/i)
-             ?? text.match(/Version\s+([\d.()\w-]+),?\s*RELEASE/i)
+  // Firmware. IOS-XE (Catalyst 9300, Stratix 5800, ...) reports the running OS train on a
+  // canonical line — "Cisco IOS XE Software, Version 17.15.05" — that has NO trailing
+  // "RELEASE". The generic "Version X, RELEASE" pattern below therefore skips it and would
+  // otherwise latch onto the bootloader line ("BOOTLDR: System Bootstrap, Version 17.15.1r,
+  // RELEASE SOFTWARE"), showing the bootstrap version instead of the firmware. So: match the
+  // IOS-XE line first; only then fall back to the classic-IOS "Version X, RELEASE SOFTWARE"
+  // line (IOS 15.x). As a safety net, the bootstrap fragment is neutralized before the
+  // fallback runs, so even collapsed single-line RTF can't trick it. Classic IOS has no
+  // "System Bootstrap, Version" fragment, so the strip is a no-op there => zero regression.
+  const fwXeRe  = /Cisco IOS[\s-]?XE Software,\s*Version\s+([0-9][\w.()-]*)/i
+  const fwRelRe = /Version\s+([\d.()\w-]+),?\s*RELEASE/i
+  const stripBootstrap = (s: string) =>
+    s.replace(/System Bootstrap,\s*Version\s+[\d.()\w-]+,?\s*RELEASE\s+SOFTWARE/gi, '')
+  const fw  = section.match(fwXeRe) ?? text.match(fwXeRe)
+             ?? stripBootstrap(section).match(fwRelRe)
+             ?? stripBootstrap(text).match(fwRelRe)
   // Capture only the duration tokens ("N weeks, N days, ...") — a bare [^\n]+ over-captures
   // on Word-exported RTF where the whole "show version" sits on one line ("... 22 minutes
   // Uptime for this control processor is ..."). Fall back to full text when the command was
